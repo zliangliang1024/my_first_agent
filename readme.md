@@ -1,3 +1,4 @@
+# 项目结构
 ```
 src/
 ├── main.rs                 # 1. 极简入口
@@ -23,3 +24,12 @@ src/
         ├── main_view.rs    #    主界面
         └── settings.rs     #    设置弹窗
 ```
+# 使用说明
+ ```
+ git clone https://github.com/zliangliang1024/my_first_agent.git
+ cargo run
+ ```
+ # 使用截图
+ ![首页](./docs/images/首页.png)
+ ![设置](./docs/images/设置.png)
+ ![提问](./docs/images/提问.png)
