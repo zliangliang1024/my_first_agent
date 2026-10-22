@@ -1,0 +1,28 @@
+[package]
+name = "my_first_agent"
+version = "0.1.0"
+edition = "2024"
+
+
+[build]
+rustc-wrapper = "sccache"
+
+[env]
+SCCACHE_DIR = "/rust/sccache-cache"  # 指定一个足够大的磁盘路径
+
+[dependencies]
+eframe = "0.37.0"
+reqwest = { version = "0.13.5", features = [
+    "json",
+    "blocking",
+    "rustls",
+    "stream",
+], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmcp = { version = "3.5.1", features = ["client", "transport-child-process"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+egui_commonmark = "0.26.0"
+futures-util = "0.3"
+dirs = "7.0.0"

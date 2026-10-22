@@ -1,0 +1,6 @@
+{
+  "deepseek_url": "https://api.deepseek.com/chat/completions",
+  "model": "deepseek-chat",
+  "dbx_exe": "C:\\Users\\你的用户名\\.dbx\\bin\\dbx-mcp.exe",
+  "system_prompt": "你是一个... (这里保留)"
+}
