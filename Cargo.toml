@@ -3,13 +3,6 @@ name = "my_first_agent"
 version = "0.1.0"
 edition = "2024"
 
-
-[build]
-rustc-wrapper = "sccache"
-
-[env]
-SCCACHE_DIR = "/rust/sccache-cache"  # 指定一个足够大的磁盘路径
-
 [dependencies]
 eframe = "0.37.0"
 reqwest = { version = "0.13.5", features = [
