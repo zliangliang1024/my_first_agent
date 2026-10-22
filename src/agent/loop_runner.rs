@@ -1,85 +1,50 @@
-use crate::llm::{ChatMessage, StreamDelta, call_deepseek_stream};
-use std::sync::mpsc::Sender;
-
 use anyhow::Result;
 use rmcp::model::CallToolRequestParams;
 use rmcp::{ServiceExt, transport::TokioChildProcess};
 use serde_json::{Value, json};
-use tokio::process::Command;
-
-use crate::config::Config;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
-/// UI → Agent 命令
-pub enum AgentCommand {
-    SendMessage(String),
-    ReloadConfig(Config), // ✅ 新增
-    Shutdown,
-}
-
-/// Agent → UI 事件
-pub enum AgentEvent {
-    Status(String),
-    Ready { tool_count: usize },
-    Thinking,
-    // ✅ 新增
-    AssistantStart,
-    AssistantDelta(String),
-
-    AssistantReply(String),
-    ToolCallStart { name: String, args: String },
-    ToolCallEnd { name: String, result: String },
-    Cancelled, // ✅ 新增
-    Error(String),
-}
+use super::{AgentCommand, AgentEvent};
+use crate::config::Config;
+use crate::llm::deepseek::call_deepseek_stream;
+use crate::llm::{ChatMessage, StreamDelta};
+use crate::storage; // ✅ 引入 storage
 
 fn mcp_tools_to_deepseek(tools: &[rmcp::model::Tool]) -> Vec<Value> {
-    tools
-        .iter()
-        .map(|t| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description.clone().unwrap_or_default(),
-                    "parameters": t.input_schema,
-                }
-            })
-        })
-        .collect()
+    tools.iter().map(|t| json!({
+        "type": "function",
+        "function": { "name": t.name, "description": t.description.clone().unwrap_or_default(), "parameters": t.input_schema }
+    })).collect()
 }
 
 pub async fn agent_loop(
     mut cfg: Config,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: Sender<AgentEvent>,
-    cancel_flag: Arc<AtomicBool>, // ✅ 新增
+    cancel_flag: Arc<AtomicBool>,
 ) {
     let _ = event_tx.send(AgentEvent::Status("正在连接 MCP...".into()));
 
-    // ---- 连接 MCP ----
-
     if cfg.dbx_exe.trim().is_empty() {
-        let _ = event_tx.send(AgentEvent::Error(
-            "未配置 DBX 路径，请点击右上角【⚙️ 设置】填写 dbx-mcp.exe 的完整路径".into(),
-        ));
-        return; // 直接退出，不要启动子进程
+        let _ = event_tx.send(AgentEvent::Error("未配置 DBX 路径，请在设置中填写".into()));
+        return;
     }
 
     let transport = match TokioChildProcess::new(Command::new(&cfg.dbx_exe)) {
         Ok(t) => t,
         Err(e) => {
-            let _ = event_tx.send(AgentEvent::Error(format!("启动 MCP 子进程失败: {}", e)));
+            let _ = event_tx.send(AgentEvent::Error(format!("启动失败: {}", e)));
             return;
         }
     };
     let client = match ().serve(transport).await {
         Ok(c) => c,
         Err(e) => {
-            let _ = event_tx.send(AgentEvent::Error(format!("MCP 初始化失败: {}", e)));
+            let _ = event_tx.send(AgentEvent::Error(format!("初始化失败: {}", e)));
             return;
         }
     };
@@ -87,56 +52,55 @@ pub async fn agent_loop(
     let tools_result = match client.list_tools(None).await {
         Ok(t) => t,
         Err(e) => {
-            let _ = event_tx.send(AgentEvent::Error(format!("获取工具列表失败: {}", e)));
+            let _ = event_tx.send(AgentEvent::Error(format!("获取工具失败: {}", e)));
             return;
         }
     };
+
     let tools = mcp_tools_to_deepseek(&tools_result.tools);
     let _ = event_tx.send(AgentEvent::Ready {
         tool_count: tools.len(),
     });
 
-    // ---- 主循环 ----
-    let mut history: Vec<ChatMessage> = Vec::new();
+    // ✅ 加载 LLM 历史
+    let mut history: Vec<ChatMessage> = storage::load_json("llm_history.json").unwrap_or_default();
 
-    // ✅ 插入 system prompt
+    // ✅ 检查并插入 System Prompt
     if !cfg.system_prompt.is_empty() {
-        history.push(ChatMessage {
-            role: "system".into(),
-            content: Some(cfg.system_prompt.clone()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
+        if history.is_empty() || history[0].role != "system" {
+            history.insert(
+                0,
+                ChatMessage {
+                    role: "system".into(),
+                    content: Some(cfg.system_prompt.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            );
+        }
     }
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             AgentCommand::Shutdown => break,
-
             AgentCommand::ReloadConfig(new_cfg) => {
                 cfg = new_cfg;
                 let _ = event_tx.send(AgentEvent::Status("配置已更新并生效".into()));
             }
-
             AgentCommand::SendMessage(text) => {
-                // ✅ 双重保险：如果 Key 为空，直接报错返回
                 if cfg.deepseek_api_key.trim().is_empty() {
-                    let _ = event_tx.send(AgentEvent::Error(
-                        "未配置 DeepSeek API Key，请在设置中填写。".into(),
-                    ));
-                    continue; // 跳过本次循环
+                    let _ = event_tx.send(AgentEvent::Error("未配置 API Key".into()));
+                    continue;
                 }
-                // ✅ 每次新请求，先重置取消标志
-                cancel_flag.store(false, Ordering::SeqCst);
 
+                cancel_flag.store(false, Ordering::SeqCst);
                 let save_point = history.len();
                 history.push(ChatMessage::user(&text));
+                storage::save_json("llm_history.json", &history); // ✅ 保存
 
                 let result: Result<()> = async {
                     loop {
                         let _ = event_tx.send(AgentEvent::Thinking);
-
-                        // ✅ 带重试逻辑的流式调用
                         let _ = event_tx.send(AgentEvent::AssistantStart);
                         let tx_delta = event_tx.clone();
                         let cancel_for_llm = cancel_flag.clone();
@@ -169,67 +133,44 @@ pub async fn agent_loop(
                                 }
                                 Err(e) => {
                                     let err_str = e.to_string();
-
-                                    // 如果是用户主动点了“停止”，直接退出，千万别重试
                                     if err_str.contains("__CANCELLED__") {
                                         anyhow::bail!("__CANCELLED__");
                                     }
-
-                                    // 如果已经达到最大重试次数，彻底放弃并报错
                                     if attempt == max_attempts {
-                                        anyhow::bail!(
-                                            "重试 {} 次后仍然失败: {}",
-                                            max_attempts,
-                                            err_str
-                                        );
+                                        anyhow::bail!("重试失败: {}", err_str);
                                     }
-
-                                    // 通知 UI 正在重试
                                     let _ = event_tx.send(AgentEvent::Status(format!(
-                                        "网络请求失败，正在重试 ({}/{})...",
+                                        "网络失败，重试 ({}/{})...",
                                         attempt, max_attempts
                                     )));
-                                    println!(
-                                        "[Retry] 第 {} 次失败: {}，准备重试...",
-                                        attempt, err_str
-                                    );
-                                    // 指数退避：第 1 次等 1 秒，第 2 次等 2 秒
-                                    let sleep_secs = 2_u64.pow(attempt - 1);
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(
-                                        sleep_secs,
-                                    ))
-                                    .await;
+                                    tokio::time::sleep(Duration::from_secs(2_u64.pow(attempt - 1)))
+                                        .await;
                                     attempt += 1;
                                 }
                             }
                         }
 
-                        // 拿到最终结果（因为已经加了 expect，如果没拿到说明逻辑有 bug）
-                        let assistant = assistant_opt.expect("重试逻辑错误：未获取到 assistant");
-
-                        // 无工具调用 → 最终回复
+                        let assistant = assistant_opt.expect("重试逻辑错误");
                         if assistant.tool_calls.is_none() {
                             let text = assistant.content.clone().unwrap_or_default();
                             history.push(assistant);
+                            storage::save_json("llm_history.json", &history); // ✅ 保存
                             let _ = event_tx.send(AgentEvent::AssistantReply(text));
                             break;
                         }
 
-                        // 有工具调用 → 逐个执行
                         let tool_calls = assistant.tool_calls.clone().unwrap();
                         history.push(assistant);
+                        storage::save_json("llm_history.json", &history); // ✅ 保存
 
                         for tc in &tool_calls {
-                            // ✅ 工具调用前检查取消
                             if cancel_flag.load(Ordering::SeqCst) {
                                 anyhow::bail!("__CANCELLED__");
                             }
-
                             let _ = event_tx.send(AgentEvent::ToolCallStart {
                                 name: tc.function.name.clone(),
                                 args: tc.function.arguments.clone(),
                             });
-
                             let args: Value = serde_json::from_str(&tc.function.arguments)
                                 .unwrap_or_else(|_| json!({}));
 
@@ -238,7 +179,6 @@ pub async fn agent_loop(
                                 params = params.with_arguments(map.clone());
                             }
 
-                            // ✅ 包裹 120 秒超时检测
                             let result_text =
                                 match timeout(Duration::from_secs(120), client.call_tool(params))
                                     .await
@@ -252,8 +192,8 @@ pub async fn agent_loop(
                                 name: tc.function.name.clone(),
                                 result: result_text.clone(),
                             });
-
                             history.push(ChatMessage::tool(&tc.id, &result_text));
+                            storage::save_json("llm_history.json", &history); // ✅ 保存
                         }
                     }
                     Ok(())
@@ -263,15 +203,29 @@ pub async fn agent_loop(
                 match result {
                     Ok(()) => {}
                     Err(e) if e.to_string().contains("__CANCELLED__") => {
-                        // ✅ 取消：回滚 history，通知 UI
                         history.truncate(save_point);
+                        storage::save_json("llm_history.json", &history); // ✅ 回滚并保存
                         let _ = event_tx.send(AgentEvent::Cancelled);
                     }
                     Err(e) => {
                         history.truncate(save_point);
+                        storage::save_json("llm_history.json", &history); // ✅ 回滚并保存
                         let _ = event_tx.send(AgentEvent::Error(format!("{}", e)));
                     }
                 }
+            }
+            AgentCommand::ClearHistory => {
+                history.clear();
+                if !cfg.system_prompt.is_empty() {
+                    history.push(ChatMessage {
+                        role: "system".into(),
+                        content: Some(cfg.system_prompt.clone()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                crate::storage::save_json("llm_history.json", &history);
+                let _ = event_tx.send(AgentEvent::Status("历史已清空".into()));
             }
         }
     }
