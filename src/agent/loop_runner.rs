@@ -163,37 +163,66 @@ pub async fn agent_loop(
                         history.push(assistant);
                         storage::save_json("llm_history.json", &history); // ✅ 保存
 
-                        for tc in &tool_calls {
-                            if cancel_flag.load(Ordering::SeqCst) {
-                                anyhow::bail!("__CANCELLED__");
-                            }
-                            let _ = event_tx.send(AgentEvent::ToolCallStart {
-                                name: tc.function.name.clone(),
-                                args: tc.function.arguments.clone(),
+                                                for tc in &tool_calls {
+                            if cancel_flag.load(Ordering::SeqCst) { anyhow::bail!("__CANCELLED__"); }
+                            
+                            // 1. 发送 Pending 事件，挂起等待审批
+                            let _ = event_tx.send(AgentEvent::ToolCallPending { 
+                                name: tc.function.name.clone(), 
+                                args: tc.function.arguments.clone() 
                             });
-                            let args: Value = serde_json::from_str(&tc.function.arguments)
-                                .unwrap_or_else(|_| json!({}));
 
-                            let mut params = CallToolRequestParams::new(tc.function.name.clone());
-                            if let Some(map) = args.as_object() {
-                                params = params.with_arguments(map.clone());
+                            // 2. 阻塞等待 UI 发送 ToolApproval 指令
+                            let mut approved = false;
+                            loop {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                                        if cancel_flag.load(Ordering::SeqCst) { anyhow::bail!("__CANCELLED__"); }
+                                    }
+                                    cmd = cmd_rx.recv() => {
+                                        match cmd {
+                                            Some(AgentCommand::ToolApproval(a)) => { approved = a; break; }
+                                            Some(AgentCommand::Shutdown) => std::process::exit(0),
+                                            _ => {} // 忽略其他指令
+                                        }
+                                    }
+                                }
                             }
 
-                            let result_text =
-                                match timeout(Duration::from_secs(120), client.call_tool(params))
-                                    .await
-                                {
-                                    Ok(Ok(r)) => serde_json::to_string(&r).unwrap_or_default(),
-                                    Ok(Err(e)) => format!("工具执行失败: {}", e),
-                                    Err(_) => "工具执行超时（超过 120 秒），已强制放弃".to_string(),
-                                };
+                            // 3. 如果被拒绝，伪造一个拒绝结果写入历史
+                            if !approved {
+                                let reject_msg = "用户拒绝执行该工具调用。";
+                                let _ = event_tx.send(AgentEvent::ToolCallEnd { 
+                                    name: tc.function.name.clone(), 
+                                    result: reject_msg.into() 
+                                });
+                                history.push(ChatMessage::tool(&tc.id, reject_msg));
+                                crate::storage::save_json("llm_history.json", &history);
+                                continue; // 直接跳过这次工具执行
+                            }
 
-                            let _ = event_tx.send(AgentEvent::ToolCallEnd {
-                                name: tc.function.name.clone(),
-                                result: result_text.clone(),
+                            // 4. 已批准，正式执行
+                            let _ = event_tx.send(AgentEvent::ToolCallStart { 
+                                name: tc.function.name.clone(), 
+                                args: tc.function.arguments.clone() 
+                            });
+                            
+                            let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
+                            let mut params = CallToolRequestParams::new(tc.function.name.clone());
+                            if let Some(map) = args.as_object() { params = params.with_arguments(map.clone()); }
+
+                            let result_text = match timeout(Duration::from_secs(120), client.call_tool(params)).await {
+                                Ok(Ok(r)) => serde_json::to_string(&r).unwrap_or_default(),
+                                Ok(Err(e)) => format!("工具执行失败: {}", e),
+                                Err(_) => "工具执行超时（超过 120 秒），已强制放弃".to_string(),
+                            };
+
+                            let _ = event_tx.send(AgentEvent::ToolCallEnd { 
+                                name: tc.function.name.clone(), 
+                                result: result_text.clone() 
                             });
                             history.push(ChatMessage::tool(&tc.id, &result_text));
-                            storage::save_json("llm_history.json", &history); // ✅ 保存
+                            crate::storage::save_json("llm_history.json", &history);
                         }
                     }
                     Ok(())
@@ -227,6 +256,8 @@ pub async fn agent_loop(
                 crate::storage::save_json("llm_history.json", &history);
                 let _ = event_tx.send(AgentEvent::Status("历史已清空".into()));
             }
+            // ✅ 忽略多余的审批指令，避免编译报错
+            AgentCommand::ToolApproval(_) => {}
         }
     }
 }

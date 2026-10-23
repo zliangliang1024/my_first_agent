@@ -107,6 +107,9 @@ impl AgentApp {
                                 }
                                 ChatItem::ToolCall { name, args, status } => {
                                     let (icon, label, color) = match status {
+                                        ToolStatus::Pending => {
+                                            ("⏸️", "等待审批", Color32::from_rgb(180, 130, 20))
+                                        } // ✅ 新增
                                         ToolStatus::Running => {
                                             ("⏳", "正在调用", Color32::from_rgb(180, 130, 20))
                                         }
@@ -136,6 +139,14 @@ impl AgentApp {
                                                     ui.code(args);
                                                     ui.add_space(6.0);
                                                     match status {
+                                                        ToolStatus::Pending => {
+                                                            ui.label(
+                                                                RichText::new("等待用户审批中...")
+                                                                    .color(Color32::from_rgb(
+                                                                        180, 130, 20,
+                                                                    )),
+                                                            );
+                                                        }
                                                         ToolStatus::Running => {
                                                             ui.horizontal(|ui| {
                                                                 ui.spinner();
@@ -281,7 +292,83 @@ impl AgentApp {
                     }
                 });
             });
+        // ✅ 审批弹窗（修复借用冲突版本）
+        if let Some((name, args)) = &self.pending_tool {
+            // 1. 先把数据克隆出来，打破对 self 的借用
+            let name_cloned = name.clone();
+            let args_cloned = args.clone();
 
+            // 2. 用一个临时变量记录用户的操作
+            let mut action: Option<bool> = None;
+
+            let modal = egui::Modal::new(egui::Id::new("tool_approval_modal"))
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::WHITE)
+                        .corner_radius(12.0)
+                        .inner_margin(Margin::symmetric(24, 20))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(220, 50, 50)))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 8],
+                            blur: 16,
+                            spread: 0,
+                            color: Color32::from_black_alpha(40),
+                        }),
+                )
+                .show(ui.ctx(), |ui| {
+                    ui.set_width(500.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("⚠️ 安全审批")
+                                .strong()
+                                .size(18.0)
+                                .color(Color32::from_rgb(220, 50, 50)),
+                        );
+                    });
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Agent 请求调用以下工具：").color(TEXT_COLOR));
+                    ui.code(&name_cloned); // ✅ 使用克隆出来的变量
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("参数：").color(TEXT_COLOR));
+                    ui.code(&args_cloned);
+                    ui.add_space(24.0);
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("❌ 拒绝").color(Color32::WHITE).strong(),
+                                )
+                                .fill(Color32::from_rgb(220, 80, 80))
+                                .min_size(egui::vec2(100.0, 36.0)),
+                            )
+                            .clicked()
+                        {
+                            action = Some(false); // ✅ 只记录动作
+                        }
+                        ui.add_space(10.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("✅ 允许").color(Color32::WHITE).strong(),
+                                )
+                                .fill(USER_BG)
+                                .min_size(egui::vec2(100.0, 36.0)),
+                            )
+                            .clicked()
+                        {
+                            action = Some(true); // ✅ 只记录动作
+                        }
+                    });
+                });
+
+            // 3. 闭包结束，借用释放。现在可以安全地修改 self 了
+            if let Some(is_approved) = action {
+                self.approve_tool(is_approved);
+            } else if modal.should_close() {
+                self.approve_tool(false); // 点外面等同拒绝
+            }
+        }
         (do_send, do_exit)
     }
 }

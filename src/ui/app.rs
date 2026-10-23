@@ -14,6 +14,7 @@ use crate::ui::style::PAGE_BG;
 
 #[derive(Serialize, Deserialize)]
 pub enum ToolStatus {
+    Pending, // ✅ 新增
     Running,
     Done(String),
 }
@@ -43,7 +44,7 @@ pub struct AgentApp {
     pub md_cache: CommonMarkCache,
     pub streaming_text: Option<String>,
     pub cancel_flag: Arc<AtomicBool>,
-
+    pub pending_tool: Option<(String, String)>, // ✅ 新增：待审批工具 (name, args)
     pub show_settings: bool,
     pub edit_cfg: Config,
     pub active_cfg: Config,
@@ -61,10 +62,11 @@ impl AgentApp {
         // ✅ 加载历史
         let mut chat: Vec<ChatItem> = storage::load_json("ui_history.json").unwrap_or_default();
 
-        // ✅ 修复错误1：使用 if let *status 判断
+        // 修改加载历史时的防崩溃逻辑
         for item in &mut chat {
             if let ChatItem::ToolCall { status, .. } = item {
-                if let ToolStatus::Running = *status {
+                if let ToolStatus::Running | ToolStatus::Pending = *status {
+                    // ✅ 更新
                     *status = ToolStatus::Done("(程序重启，操作已中断)".into());
                 }
             }
@@ -85,6 +87,7 @@ impl AgentApp {
             md_cache: CommonMarkCache::default(),
             streaming_text: None,
             cancel_flag,
+            pending_tool: None,
             show_settings: is_key_empty,
             edit_cfg: initial_cfg.clone(),
             active_cfg: initial_cfg,
@@ -125,17 +128,39 @@ impl AgentApp {
                     self.status = "就绪".into();
                     storage::save_json("ui_history.json", &self.chat);
                 }
-                AgentEvent::ToolCallStart { name, args } => {
+                // 在 poll_events 的 match 里增加：
+                AgentEvent::ToolCallPending { name, args } => {
                     self.streaming_text = None;
-                    self.status = format!("调用 {}", name);
+                    self.pending_tool = Some((name.clone(), args.clone()));
+                    self.status = format!("等待审批: {}", name);
+                    // 先在历史里插入一个 Pending 状态的气泡
                     self.chat.push(ChatItem::ToolCall {
                         name,
                         args,
-                        status: ToolStatus::Running,
+                        status: ToolStatus::Pending,
                     });
                     storage::save_json("ui_history.json", &self.chat);
                 }
+                AgentEvent::ToolCallStart { name, args } => {
+                    // 用户已批准，把 Pending 变成 Running
+                    self.pending_tool = None;
+                    self.status = format!("调用 {}", name);
+                    let idx = self.chat.iter().rposition(|item| {
+                        if let ChatItem::ToolCall { status, .. } = item {
+                            matches!(status, &ToolStatus::Pending)
+                        } else {
+                            false
+                        }
+                    });
+                    if let Some(i) = idx {
+                        if let ChatItem::ToolCall { status, .. } = &mut self.chat[i] {
+                            *status = ToolStatus::Running;
+                        }
+                    }
+                    storage::save_json("ui_history.json", &self.chat);
+                }
                 AgentEvent::ToolCallEnd { name, result } => {
+                    self.pending_tool = None; // 确保清理
                     let idx = self.chat.iter().rposition(|item: &ChatItem| {
                         if let ChatItem::ToolCall {
                             name: n, status, ..
@@ -185,6 +210,18 @@ impl AgentApp {
         storage::save_json("ui_history.json", &self.chat);
         let _ = self.cmd_tx.send(AgentCommand::SendMessage(text));
     }
+    // ✅ 在 impl AgentApp 里加这个方法
+    pub fn approve_tool(&mut self, approved: bool) {
+        if self.pending_tool.is_some() {
+            let _ = self.cmd_tx.send(AgentCommand::ToolApproval(approved));
+            self.pending_tool = None;
+            self.status = if approved {
+                "正在执行...".into()
+            } else {
+                "已拒绝执行".into()
+            };
+        }
+    }
 }
 
 // ✅ 修复错误2：使用 fn ui 替代 fn update
@@ -197,7 +234,7 @@ impl eframe::App for AgentApp {
         if !has_api_key {
             self.show_settings = true;
         }
-        
+
         if self.is_waiting || !self.mcp_ready || self.streaming_text.is_some() {
             ui.ctx().request_repaint();
         }
