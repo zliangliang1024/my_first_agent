@@ -1,6 +1,6 @@
 pub mod loop_runner;
 pub mod policy;
-
+pub mod skill_loader; // ✅ 新增
 use crate::config::Config;
 
 pub enum AgentCommand {
