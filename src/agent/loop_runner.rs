@@ -58,6 +58,14 @@ pub async fn agent_loop(
     };
 
     let tools = mcp_tools_to_deepseek(&tools_result.tools);
+
+    // ✅ 新增：在启动时，利用 MCP 注解和本地策略，构建一张“工具风险字典”
+    let mut tool_risks = std::collections::HashMap::new();
+    for t in &tools_result.tools {
+        let risk = crate::agent::policy::evaluate_tool_risk(t);
+        tool_risks.insert(t.name.to_string(), risk);
+    }
+
     let _ = event_tx.send(AgentEvent::Ready {
         tool_count: tools.len(),
     });
@@ -108,6 +116,7 @@ pub async fn agent_loop(
                         let mut attempt = 1;
                         let max_attempts = 3;
                         let mut assistant_opt = None;
+                        let mut usage_opt = None; // ✅ 新增
 
                         while attempt <= max_attempts {
                             let res = call_deepseek_stream(
@@ -127,8 +136,9 @@ pub async fn agent_loop(
                             .await;
 
                             match res {
-                                Ok(msg) => {
+                                Ok((msg,usage)) => {
                                     assistant_opt = Some(msg);
+                                    usage_opt = usage; // ✅ 记录
                                     break;
                                 }
                                 Err(e) => {
@@ -150,7 +160,44 @@ pub async fn agent_loop(
                             }
                         }
 
+                        // ✅ 发出 Token 统计事件
+                        if let Some(u) = usage_opt {
+                            let _ = event_tx.send(AgentEvent::TokenUsage { 
+                                total_tokens: u.total_tokens, 
+                                prompt_tokens: u.prompt_tokens 
+                            });
+                        }
+
                         let assistant = assistant_opt.expect("重试逻辑错误");
+                                                // ✅ 上下文压缩逻辑：保留 System Prompt 和最近 20 条消息
+                        if history.len() > 25 {
+                            let _ = event_tx.send(AgentEvent::Status("上下文过长，正在压缩早期记忆...".into()));
+                            
+                            // 提取 System Prompt (如果有)
+                            let system_msg = if !history.is_empty() && history[0].role == "system" {
+                                Some(history[0].clone())
+                            } else {
+                                None
+                            };
+                            
+                            // 只保留最近的 16 条消息
+                            let recent_msgs: Vec<ChatMessage> = history.iter().rev().take(16).cloned().collect::<Vec<_>>().into_iter().rev().collect();
+                            
+                            history.clear();
+                            if let Some(sys) = system_msg {
+                                history.push(sys);
+                            }
+                            
+                            // 插入一条摘要标记，告诉大模型之前有记忆被删除了
+                            history.push(ChatMessage { 
+                                role: "system".into(), 
+                                content: Some("[注：由于对话较长，早期的历史消息已被压缩丢弃]".into()), 
+                                tool_calls: None, tool_call_id: None 
+                            });
+                            
+                            history.extend(recent_msgs);
+                            crate::storage::save_json("llm_history.json", &history);
+                        }
                         if assistant.tool_calls.is_none() {
                             let text = assistant.content.clone().unwrap_or_default();
                             history.push(assistant);
@@ -163,13 +210,68 @@ pub async fn agent_loop(
                         history.push(assistant);
                         storage::save_json("llm_history.json", &history); // ✅ 保存
 
-                                                for tc in &tool_calls {
+                        for tc in &tool_calls {
                             if cancel_flag.load(Ordering::SeqCst) { anyhow::bail!("__CANCELLED__"); }
+
+                            // ✅ 从字典里查出该工具的风险等级
+                            let risk = *tool_risks.get(&tc.function.name).unwrap_or(&crate::agent::policy::RiskLevel::High);
+                            
+                            // 1. 明确被拉黑的工具
+                            if let crate::agent::policy::RiskLevel::Deny = risk {
+                                let reject_msg = "系统拦截：该工具已被策略模块拉黑，禁止执行。";
+                                let _ = event_tx.send(AgentEvent::ToolCallEnd {
+                                    id: tc.id.clone(), // ✅
+                                    name: tc.function.name.clone(),
+                                    result: reject_msg.into()
+                                });
+                                history.push(ChatMessage::tool(&tc.id, reject_msg));
+                                continue;
+                            }
+
+                            // 2. 只有 High 需要审批
+                            let mut approved = risk == crate::agent::policy::RiskLevel::Low;
+
+                            if risk == crate::agent::policy::RiskLevel::High {
+                                // 挂起审批逻辑
+                                let _ = event_tx.send(AgentEvent::ToolCallPending {
+                                    id: tc.id.clone(), // ✅
+                                    name: tc.function.name.clone(),
+                                    args: tc.function.arguments.clone()
+                                });
+
+                                loop {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                                            if cancel_flag.load(Ordering::SeqCst) { anyhow::bail!("__CANCELLED__"); }
+                                        }
+                                        cmd = cmd_rx.recv() => {
+                                            match cmd {
+                                                Some(AgentCommand::ToolApproval(a)) => { approved = a; break; }
+                                                Some(AgentCommand::Shutdown) => std::process::exit(0),
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. 被拒绝直接跳过
+                            if !approved {
+                                let reject_msg = "用户拒绝执行该工具调用。";
+                                let _ = event_tx.send(AgentEvent::ToolCallEnd {
+                                    id: tc.id.clone(), // ✅
+                                    name: tc.function.name.clone(),
+                                    result: reject_msg.into()
+                                });
+                                history.push(ChatMessage::tool(&tc.id, reject_msg));
+                                continue;
+                            }
                             
                             // 1. 发送 Pending 事件，挂起等待审批
-                            let _ = event_tx.send(AgentEvent::ToolCallPending { 
-                                name: tc.function.name.clone(), 
-                                args: tc.function.arguments.clone() 
+                            let _ = event_tx.send(AgentEvent::ToolCallPending {
+                                id: tc.id.clone(), // ✅
+                                name: tc.function.name.clone(),
+                                args: tc.function.arguments.clone()
                             });
 
                             // 2. 阻塞等待 UI 发送 ToolApproval 指令
@@ -192,9 +294,10 @@ pub async fn agent_loop(
                             // 3. 如果被拒绝，伪造一个拒绝结果写入历史
                             if !approved {
                                 let reject_msg = "用户拒绝执行该工具调用。";
-                                let _ = event_tx.send(AgentEvent::ToolCallEnd { 
-                                    name: tc.function.name.clone(), 
-                                    result: reject_msg.into() 
+                                let _ = event_tx.send(AgentEvent::ToolCallEnd {
+                                    id: tc.id.clone(), // ✅
+                                    name: tc.function.name.clone(),
+                                    result: reject_msg.into()
                                 });
                                 history.push(ChatMessage::tool(&tc.id, reject_msg));
                                 crate::storage::save_json("llm_history.json", &history);
@@ -202,9 +305,10 @@ pub async fn agent_loop(
                             }
 
                             // 4. 已批准，正式执行
-                            let _ = event_tx.send(AgentEvent::ToolCallStart { 
-                                name: tc.function.name.clone(), 
-                                args: tc.function.arguments.clone() 
+                            let _ = event_tx.send(AgentEvent::ToolCallStart {
+                                id: tc.id.clone(), // ✅
+                                name: tc.function.name.clone(),
+                                args: tc.function.arguments.clone()
                             });
                             
                             let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
@@ -217,9 +321,10 @@ pub async fn agent_loop(
                                 Err(_) => "工具执行超时（超过 120 秒），已强制放弃".to_string(),
                             };
 
-                            let _ = event_tx.send(AgentEvent::ToolCallEnd { 
-                                name: tc.function.name.clone(), 
-                                result: result_text.clone() 
+                            let _ = event_tx.send(AgentEvent::ToolCallEnd {
+                                id: tc.id.clone(), // ✅
+                                name: tc.function.name.clone(),
+                                result: result_text.clone()
                             });
                             history.push(ChatMessage::tool(&tc.id, &result_text));
                             crate::storage::save_json("llm_history.json", &history);

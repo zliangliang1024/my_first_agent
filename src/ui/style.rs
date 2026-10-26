@@ -31,6 +31,7 @@ pub fn setup_style(ctx: &egui::Context) {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         style.spacing.button_padding = egui::vec2(14.0, 6.0);
         style.spacing.scroll.bar_width = 6.0;
+        style.spacing.interact_size.y = 24.0
     });
 }
 

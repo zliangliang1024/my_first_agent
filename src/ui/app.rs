@@ -24,6 +24,7 @@ pub enum ChatItem {
     User(String),
     Assistant(String),
     ToolCall {
+        id: String, // ✅ 新增
         name: String,
         args: String,
         status: ToolStatus,
@@ -48,6 +49,8 @@ pub struct AgentApp {
     pub show_settings: bool,
     pub edit_cfg: Config,
     pub active_cfg: Config,
+    pub total_tokens: u64,       // ✅ 新增
+    pub last_prompt_tokens: u64, // ✅ 新增
 }
 
 impl AgentApp {
@@ -64,13 +67,16 @@ impl AgentApp {
 
         // 修改加载历史时的防崩溃逻辑
         for item in &mut chat {
+            // ✅ 去掉 status 后面的 : ToolStatus
             if let ChatItem::ToolCall { status, .. } = item {
-                if let ToolStatus::Running | ToolStatus::Pending = *status {
-                    // ✅ 更新
+                // ✅ 用 if let 或 matches!
+                if matches!(status, ToolStatus::Running | ToolStatus::Pending) {
                     *status = ToolStatus::Done("(程序重启，操作已中断)".into());
                 }
             }
         }
+
+        let saved_total_tokens: u64 = storage::load_json("total_tokens.json").unwrap_or(0);
 
         Self {
             cmd_tx,
@@ -91,12 +97,25 @@ impl AgentApp {
             show_settings: is_key_empty,
             edit_cfg: initial_cfg.clone(),
             active_cfg: initial_cfg,
+            total_tokens: saved_total_tokens,
+            last_prompt_tokens: 0,
         }
     }
 
-    pub fn poll_events(&mut self) {
+    pub fn poll_events(&mut self) -> bool {
+        let mut handled = false;
         while let Ok(ev) = self.event_rx.try_recv() {
+            handled = true; // ✅ 只要进循环，说明有事件到了
             match ev {
+                AgentEvent::TokenUsage {
+                    total_tokens,
+                    prompt_tokens,
+                } => {
+                    self.total_tokens += total_tokens; // ✅ 累加
+                    self.last_prompt_tokens = prompt_tokens;
+                    // ✅ 每次累加后，立刻存盘
+                    crate::storage::save_json("total_tokens.json", &self.total_tokens);
+                }
                 AgentEvent::Status(s) => {
                     self.status = s.clone();
                     self.chat.push(ChatItem::Status(s));
@@ -123,61 +142,70 @@ impl AgentApp {
                 },
                 AgentEvent::AssistantReply(text) => {
                     self.streaming_text = None;
+                    self.pending_tool = None; // ✅ 确保模态框状态清空
+
+                    // ✅ 终极清扫：只要最终回复到达，说明这轮彻底结束。
+                    // 所有遗留的 Pending 或 Running 工具，全部强制标为 Done，防止 UI 鬼畜！
+                    for item in self.chat.iter_mut() {
+                        if let ChatItem::ToolCall { status, .. } = item {
+                            if matches!(status, ToolStatus::Pending | ToolStatus::Running) {
+                                *status =
+                                    ToolStatus::Done("(工具执行完毕，已由 Agent 汇总结果)".into());
+                            }
+                        }
+                    }
+
                     self.chat.push(ChatItem::Assistant(text));
                     self.is_waiting = false;
                     self.status = "就绪".into();
-                    storage::save_json("ui_history.json", &self.chat);
+                    crate::storage::save_json("ui_history.json", &self.chat);
                 }
                 // 在 poll_events 的 match 里增加：
-                AgentEvent::ToolCallPending { name, args } => {
+                AgentEvent::ToolCallPending { id, name, args } => {
                     self.streaming_text = None;
                     self.pending_tool = Some((name.clone(), args.clone()));
                     self.status = format!("等待审批: {}", name);
-                    // 先在历史里插入一个 Pending 状态的气泡
+                    // ✅ 使用 id 入库
                     self.chat.push(ChatItem::ToolCall {
+                        id,
                         name,
                         args,
                         status: ToolStatus::Pending,
                     });
                     storage::save_json("ui_history.json", &self.chat);
                 }
-                AgentEvent::ToolCallStart { name, args } => {
-                    // 用户已批准，把 Pending 变成 Running
+                AgentEvent::ToolCallStart { id, name, .. } => {
                     self.pending_tool = None;
                     self.status = format!("调用 {}", name);
-                    let idx = self.chat.iter().rposition(|item| {
-                        if let ChatItem::ToolCall { status, .. } = item {
-                            matches!(status, &ToolStatus::Pending)
-                        } else {
-                            false
-                        }
-                    });
-                    if let Some(i) = idx {
-                        if let ChatItem::ToolCall { status, .. } = &mut self.chat[i] {
-                            *status = ToolStatus::Running;
+                    // ✅ 按 id 查找
+                    for item in self.chat.iter_mut() {
+                        if let ChatItem::ToolCall {
+                            id: n_id, status, ..
+                        } = item
+                        {
+                            if n_id == &id {
+                                *status = ToolStatus::Running;
+                                break;
+                            }
                         }
                     }
                     storage::save_json("ui_history.json", &self.chat);
                 }
-                AgentEvent::ToolCallEnd { name, result } => {
-                    self.pending_tool = None; // 确保清理
-                    let idx = self.chat.iter().rposition(|item: &ChatItem| {
+                AgentEvent::ToolCallEnd { id, name, result } => {
+                    self.pending_tool = None;
+                    self.status = "思考中...".into();
+                    // ✅ 按 id 查找并修改
+                    for item in self.chat.iter_mut() {
                         if let ChatItem::ToolCall {
-                            name: n, status, ..
+                            id: n_id, status, ..
                         } = item
                         {
-                            n == &name && matches!(status, &ToolStatus::Running)
-                        } else {
-                            false
-                        }
-                    });
-                    if let Some(i) = idx {
-                        let item: &mut ChatItem = &mut self.chat[i];
-                        if let ChatItem::ToolCall { status, .. } = item {
-                            *status = ToolStatus::Done(result);
+                            if n_id == &id {
+                                *status = ToolStatus::Done(result.clone());
+                                break;
+                            }
                         }
                     }
-                    self.status = "思考中...".into();
                     storage::save_json("ui_history.json", &self.chat);
                 }
                 AgentEvent::Cancelled => {
@@ -196,6 +224,7 @@ impl AgentApp {
                 }
             }
         }
+        handled // ✅ 返回结果
     }
 
     pub fn send_current_input(&mut self) {
@@ -227,12 +256,16 @@ impl AgentApp {
 // ✅ 修复错误2：使用 fn ui 替代 fn update
 impl eframe::App for AgentApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_events();
+        let handled_events = self.poll_events(); // ✅ 接收是否处理了事件
 
         let has_api_key = !self.active_cfg.deepseek_api_key.trim().is_empty();
-        // ✅ 强制拦截：没有 Key 就必定弹窗，关不掉！
         if !has_api_key {
             self.show_settings = true;
+        }
+
+        // ✅ 关键：只要处理了事件，或者正在等待，或者正在生成，就强制请求重绘
+        if handled_events || self.is_waiting || !self.mcp_ready || self.streaming_text.is_some() {
+            ui.ctx().request_repaint();
         }
 
         if self.is_waiting || !self.mcp_ready || self.streaming_text.is_some() {

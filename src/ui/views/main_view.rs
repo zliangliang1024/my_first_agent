@@ -10,7 +10,7 @@ impl AgentApp {
         let mut do_send = false;
         let mut do_exit = false;
 
-        // 顶部状态栏
+        // ✅ 第一行：标题 + 右侧操作按钮
         ui.horizontal(|ui| {
             ui.add_space(2.0);
             ui.heading(
@@ -19,7 +19,52 @@ impl AgentApp {
                     .strong()
                     .size(18.0),
             );
-            ui.add_space(8.0);
+
+            // 右侧按钮组（从右向左排版）
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 退出按钮
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("退出").color(TEXT_COLOR).size(13.0))
+                            .fill(Color32::from_rgb(233, 236, 240))
+                            .corner_radius(6.0),
+                    )
+                    .clicked()
+                {
+                    do_exit = true;
+                }
+                // 设置按钮
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("⚙️ 设置").color(TEXT_COLOR).size(13.0))
+                            .fill(Color32::from_rgb(233, 236, 240))
+                            .corner_radius(6.0),
+                    )
+                    .clicked()
+                {
+                    self.show_settings = true;
+                }
+                // 清空按钮
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("🗑️ 清空").color(TEXT_COLOR).size(13.0))
+                            .fill(Color32::from_rgb(233, 236, 240))
+                            .corner_radius(6.0),
+                    )
+                    .clicked()
+                {
+                    self.chat.clear();
+                    self.total_tokens = 0; // ✅ 清零
+                    crate::storage::save_json("ui_history.json", &self.chat);
+                    crate::storage::save_json("total_tokens.json", &self.total_tokens); // ✅ 保存 0
+                    let _ = self.cmd_tx.send(AgentCommand::ClearHistory);
+                }
+            });
+        });
+
+        // ✅ 第二行：连接状态 + 右侧 Token 统计
+        ui.horizontal(|ui| {
+            // 左侧：状态文字
             let status_color = if !has_api_key {
                 Color32::RED
             } else {
@@ -31,40 +76,24 @@ impl AgentApp {
                     .size(13.0),
             );
 
+            // 右侧：Token 徽章（从右向左排版，靠右显示）
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("退出").color(TEXT_COLOR).size(13.0))
-                            .fill(Color32::from_rgb(233, 236, 240))
-                            .corner_radius(6.0),
-                    )
-                    .clicked()
-                {
-                    do_exit = true;
-                }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("⚙️ 设置").color(TEXT_COLOR).size(13.0))
-                            .fill(Color32::from_rgb(233, 236, 240))
-                            .corner_radius(6.0),
-                    )
-                    .clicked()
-                {
-                    self.show_settings = true;
-                }
-                // ✅ 新增清空按钮
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("🗑️ 清空").color(TEXT_COLOR).size(13.0))
-                            .fill(Color32::from_rgb(233, 236, 240))
-                            .corner_radius(6.0),
-                    )
-                    .clicked()
-                {
-                    self.chat.clear();
-                    crate::storage::save_json("ui_history.json", &self.chat); // 清空 UI 记录
-                    let _ = self.cmd_tx.send(AgentCommand::ClearHistory); // 清空 LLM 记忆
-                }
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(240, 243, 248)) // 浅灰蓝色背景
+                    .corner_radius(10.0)
+                    .inner_margin(Margin::symmetric(8, 2))
+                    .show(ui, |ui| {
+                        // 格式：⚡ 本轮 1240 / 累计 8544
+                        ui.label(
+                            RichText::new(format!(
+                                "⚡ 本轮 {} / 累计 {}",
+                                self.last_prompt_tokens, self.total_tokens
+                            ))
+                            .color(Color32::from_rgb(80, 90, 105))
+                            .size(12.0)
+                            .strong(),
+                        );
+                    });
             });
         });
 
@@ -105,7 +134,12 @@ impl AgentApp {
                                     bubble_md(ui, ASSIST_BG, false, &mut md_cache, text, idx);
                                     ui.add_space(8.0);
                                 }
-                                ChatItem::ToolCall { name, args, status } => {
+                                ChatItem::ToolCall {
+                                    id,
+                                    name,
+                                    args,
+                                    status,
+                                } => {
                                     let (icon, label, color) = match status {
                                         ToolStatus::Pending => {
                                             ("⏸️", "等待审批", Color32::from_rgb(180, 130, 20))
@@ -226,9 +260,14 @@ impl AgentApp {
         ui.add_space(14.0);
 
         // 底部输入区
-        let enabled = self.mcp_ready && !self.is_waiting && has_api_key;
+        // ✅ 增加 pending_tool 判断：如果有工具在等待审批，就锁死输入
+        let is_pending_approval = self.pending_tool.is_some();
+        let enabled = self.mcp_ready && !self.is_waiting && has_api_key && !is_pending_approval;
+
         let hint = if !has_api_key {
             "⚠️ 请先点击右上角【⚙️ 设置】填写 API Key"
+        } else if is_pending_approval {
+            "⚠️ 请先处理上方的安全审批请求"
         } else if self.is_waiting {
             "等待回复..."
         } else if !self.mcp_ready {
@@ -263,7 +302,9 @@ impl AgentApp {
                         }
                     }
 
-                    let btn_fill = if self.is_waiting {
+                    let btn_fill = if is_pending_approval {
+                        Color32::from_rgb(200, 205, 212)
+                    } else if self.is_waiting {
                         Color32::from_rgb(220, 80, 80)
                     } else if enabled {
                         USER_BG
