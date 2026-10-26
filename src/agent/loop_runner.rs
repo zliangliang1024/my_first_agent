@@ -57,7 +57,23 @@ pub async fn agent_loop(
         }
     };
 
-    let tools = mcp_tools_to_deepseek(&tools_result.tools);
+    let mut tools = mcp_tools_to_deepseek(&tools_result.tools);
+
+        // ✅ 注入虚拟工具 read_skill，供模型查阅技能详情
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": "read_skill",
+            "description": "读取指定技能的完整 Markdown 文档。参数为技能名称。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": { "type": "string", "description": "要读取的技能名称，例如 server-health" }
+                },
+                "required": ["skill_name"]
+            }
+        }
+    }));
 
     // ✅ 新增：在启动时，利用 MCP 注解和本地策略，构建一张“工具风险字典”
     let mut tool_risks = std::collections::HashMap::new();
@@ -73,18 +89,20 @@ pub async fn agent_loop(
     // ✅ 加载 LLM 历史
     let mut history: Vec<ChatMessage> = storage::load_json("llm_history.json").unwrap_or_default();
 
-    // ✅ 检查并插入 System Prompt
-    if !cfg.system_prompt.is_empty() {
+    // ✅ 动态加载项目规则和技能列表
+    let agent_context = crate::agent::skill_loader::load_agent_context();
+
+    let mut final_system_prompt = cfg.system_prompt.clone();
+    if !agent_context.is_empty() {
+        final_system_prompt = format!("{}\n\n{}", final_system_prompt, agent_context);
+    }
+
+    if !final_system_prompt.is_empty() {
         if history.is_empty() || history[0].role != "system" {
-            history.insert(
-                0,
-                ChatMessage {
-                    role: "system".into(),
-                    content: Some(cfg.system_prompt.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-            );
+            history.insert(0, ChatMessage { role: "system".into(), content: Some(final_system_prompt), tool_calls: None, tool_call_id: None });
+        } else {
+            // 如果已经有 system，更新它的内容
+            history[0].content = Some(final_system_prompt);
         }
     }
 
@@ -162,9 +180,9 @@ pub async fn agent_loop(
 
                         // ✅ 发出 Token 统计事件
                         if let Some(u) = usage_opt {
-                            let _ = event_tx.send(AgentEvent::TokenUsage { 
-                                total_tokens: u.total_tokens, 
-                                prompt_tokens: u.prompt_tokens 
+                            let _ = event_tx.send(AgentEvent::TokenUsage {
+                                total_tokens: u.total_tokens,
+                                prompt_tokens: u.prompt_tokens
                             });
                         }
 
@@ -189,10 +207,10 @@ pub async fn agent_loop(
                             }
                             
                             // 插入一条摘要标记，告诉大模型之前有记忆被删除了
-                            history.push(ChatMessage { 
-                                role: "system".into(), 
-                                content: Some("[注：由于对话较长，早期的历史消息已被压缩丢弃]".into()), 
-                                tool_calls: None, tool_call_id: None 
+                            history.push(ChatMessage {
+                                role: "system".into(),
+                                content: Some("[注：由于对话较长，早期的历史消息已被压缩丢弃]".into()),
+                                tool_calls: None, tool_call_id: None
                             });
                             
                             history.extend(recent_msgs);
@@ -212,6 +230,27 @@ pub async fn agent_loop(
 
                         for tc in &tool_calls {
                             if cancel_flag.load(Ordering::SeqCst) { anyhow::bail!("__CANCELLED__"); }
+
+                            // ✅ 拦截本地虚拟工具 read_skill
+                            if tc.function.name == "read_skill" {
+                                let _ = event_tx.send(AgentEvent::ToolCallStart {
+                                    id: tc.id.clone(), name: tc.function.name.clone(), args: tc.function.arguments.clone()
+                                });
+                                
+                                let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
+                                let skill_name = args.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
+                                
+                                let content = crate::agent::skill_loader::read_skill_file(skill_name);
+                                
+                                let _ = event_tx.send(AgentEvent::ToolCallEnd {
+                                    id: tc.id.clone(), name: tc.function.name.clone(), result: content.clone()
+                                });
+                                
+                                history.push(ChatMessage::tool(&tc.id, &content));
+                                crate::storage::save_json("llm_history.json", &history);
+                                
+                                continue; // 拦截成功，直接进入下一个工具，不走 MCP
+                            }
 
                             // ✅ 从字典里查出该工具的风险等级
                             let risk = *tool_risks.get(&tc.function.name).unwrap_or(&crate::agent::policy::RiskLevel::High);
