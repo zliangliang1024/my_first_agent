@@ -193,27 +193,41 @@ pub async fn agent_loop(
                         let mut usage_opt = None; // ✅ 新增
 
                         while attempt <= max_attempts {
-                            let res = call_deepseek_stream(
-                                &cfg,
-                                &history,
-                                &tools,
-                                cancel_for_llm.clone(),
-                                {
-                                    let tx = tx_delta.clone();
-                                    move |delta| {
-                                        match delta {
-                                            StreamDelta::Content(s) => {
-                                                let _ = tx.send(AgentEvent::AssistantDelta(s));
-                                            }
-                                            // ✅ 如果以后加了 StreamDelta::Other，这里可以处理
-                                            // _ => {}
-                                        }
+                        // ✅ 每次请求前，强制清洗历史里的“孤儿 tool”消息
+                        let mut valid_tool_ids = std::collections::HashSet::new();
+                        let mut clean_history = Vec::new();
+                            
+                        for msg in &history {
+                            if msg.role == "assistant" {
+                                if let Some(tcs) = &msg.tool_calls {
+                                    for tc in tcs { valid_tool_ids.insert(tc.id.clone()); }
+                                }
+                                clean_history.push(msg.clone());
+                            } else if msg.role == "tool" {
+                                if let Some(id) = &msg.tool_call_id {
+                                    // 只有当这个 tool_id 在前面出现过，才保留它
+                                    if valid_tool_ids.contains(id) {
+                                        clean_history.push(msg.clone());
+                                        valid_tool_ids.remove(id);
                                     }
-                                },
-                            )
-                            .await;
+                                }
+                            } else {
+                                clean_history.push(msg.clone());
+                            }
+                        }
+
+                            // 使用清洗后的历史去请求
+                            let res = call_deepseek_stream(&cfg, &clean_history, &tools, cancel_for_llm.clone(), {
+                                let tx = tx_delta.clone();
+                                move |delta| { 
+                                    match delta {
+                                        StreamDelta::Content(s) => { let _ = tx.send(AgentEvent::AssistantDelta(s)); }
+                                    }
+                                }
+                            }).await;
 
                             match res {
+                                // ...
                                 Ok((msg,usage)) => {
                                     assistant_opt = Some(msg);
                                     usage_opt = usage; // ✅ 记录
@@ -265,7 +279,12 @@ pub async fn agent_loop(
                             };
                             
                             // 只保留最近的 16 条消息
-                            let recent_msgs: Vec<ChatMessage> = history.iter().rev().take(16).cloned().collect::<Vec<_>>().into_iter().rev().collect();
+                            let mut recent_msgs: Vec<ChatMessage> = history.iter().rev().take(16).cloned().collect::<Vec<_>>().into_iter().rev().collect();
+
+                            // ✅ 防止压缩后开头是孤儿 tool 消息
+                            while !recent_msgs.is_empty() && recent_msgs[0].role == "tool" {
+                                recent_msgs.remove(0);
+                            }
                             
                             history.clear();
                             if let Some(sys) = system_msg {
