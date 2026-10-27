@@ -86,8 +86,36 @@ pub async fn agent_loop(
         tool_count: tools.len(),
     });
 
-    // ✅ 加载 LLM 历史
-    let mut history: Vec<ChatMessage> = storage::load_json("llm_history.json").unwrap_or_default();
+        // ✅ 加载 LLM 的历史记忆
+    let mut history: Vec<ChatMessage> = crate::storage::load_json("llm_history.json").unwrap_or_default();
+    
+    // ✅ 清洗不合法的孤儿 tool 消息
+    let mut clean_history = Vec::new();
+    let mut valid_tool_ids = std::collections::HashSet::new();
+    
+    for msg in history {
+        if msg.role == "assistant" {
+            if let Some(tcs) = &msg.tool_calls {
+                for tc in tcs { valid_tool_ids.insert(tc.id.clone()); }
+            }
+            clean_history.push(msg);
+        } else if msg.role == "tool" {
+            // ✅ 先 clone 出来，断绝与 msg 的借用关系
+            let id_opt = msg.tool_call_id.clone();
+            
+            if let Some(id) = id_opt {
+                if valid_tool_ids.contains(&id) {
+                    valid_tool_ids.remove(&id);
+                    // 现在没有借用冲突了，放心 push
+                    clean_history.push(msg);
+                }
+                // 如果 valid_tool_ids 里没有，说明是孤儿消息，直接丢弃
+            }
+        } else {
+            clean_history.push(msg);
+        }
+    }
+    history = clean_history;
 
     // ✅ 动态加载项目规则和技能列表
     let agent_context = crate::agent::skill_loader::load_agent_context();
@@ -145,8 +173,12 @@ pub async fn agent_loop(
                                 {
                                     let tx = tx_delta.clone();
                                     move |delta| {
-                                        if let StreamDelta::Content(s) = delta {
-                                            let _ = tx.send(AgentEvent::AssistantDelta(s));
+                                        match delta {
+                                            StreamDelta::Content(s) => {
+                                                let _ = tx.send(AgentEvent::AssistantDelta(s));
+                                            }
+                                            // ✅ 如果以后加了 StreamDelta::Other，这里可以处理
+                                            // _ => {}
                                         }
                                     }
                                 },
@@ -159,20 +191,26 @@ pub async fn agent_loop(
                                     usage_opt = usage; // ✅ 记录
                                     break;
                                 }
-                                Err(e) => {
+                                                                Err(e) => {
                                     let err_str = e.to_string();
+                                    
+                                    // 用户取消，直接退出
                                     if err_str.contains("__CANCELLED__") {
                                         anyhow::bail!("__CANCELLED__");
                                     }
+                                    
+                                    // ✅ 遇到 400 Bad Request (参数/格式错误)，重试也没用，直接报错
+                                    if err_str.contains("400") {
+                                        anyhow::bail!("请求格式错误 (400)，请清空历史记录后重试。详情: {}", err_str);
+                                    }
+
+                                    // 只有非 400 的错误（如超时、断网）才重试
                                     if attempt == max_attempts {
                                         anyhow::bail!("重试失败: {}", err_str);
                                     }
-                                    let _ = event_tx.send(AgentEvent::Status(format!(
-                                        "网络失败，重试 ({}/{})...",
-                                        attempt, max_attempts
-                                    )));
-                                    tokio::time::sleep(Duration::from_secs(2_u64.pow(attempt - 1)))
-                                        .await;
+                                    
+                                    let _ = event_tx.send(AgentEvent::Status(format!("网络或服务器异常，重试 ({}/{})...", attempt, max_attempts)));
+                                    tokio::time::sleep(Duration::from_secs(2_u64.pow(attempt - 1))).await;
                                     attempt += 1;
                                 }
                             }
