@@ -9,7 +9,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{AgentCommand, AgentEvent};
 use crate::config::Config;
-use crate::storage;
+use crate::storage::{self, SessionMeta};
 use crate::ui::style::PAGE_BG;
 
 #[derive(Serialize, Deserialize)]
@@ -49,8 +49,12 @@ pub struct AgentApp {
     pub show_settings: bool,
     pub edit_cfg: Config,
     pub active_cfg: Config,
-    pub total_tokens: u64,       // ✅ 新增
-    pub last_prompt_tokens: u64, // ✅ 新增
+    pub total_tokens: u64,           // ✅ 新增
+    pub last_prompt_tokens: u64,     // ✅ 新增
+    pub sessions: Vec<SessionMeta>,  // ✅ 会话列表
+    pub current_session_id: String,  // ✅ 当前选中的 ID
+    pub renaming_id: Option<String>, // ✅ 记录正在重命名的会话 ID
+    pub rename_buffer: String,       // ✅ 重命名时的输入缓冲
 }
 
 impl AgentApp {
@@ -61,6 +65,20 @@ impl AgentApp {
         initial_cfg: Config,
     ) -> Self {
         let is_key_empty = initial_cfg.deepseek_api_key.trim().is_empty();
+
+        // 获取 session
+        let mut sessions = crate::storage::load_sessions_index();
+        let current_session_id = if let Some(first) = sessions.first() {
+            first.id.clone()
+        } else {
+            let id = format!("session_{}", chrono::Local::now().timestamp_millis());
+            sessions.push(SessionMeta {
+                id: id.clone(),
+                title: "新对话".into(),
+            });
+            crate::storage::save_sessions_index(&sessions);
+            id
+        };
 
         // ✅ 加载历史
         let mut chat: Vec<ChatItem> = storage::load_json("ui_history.json").unwrap_or_default();
@@ -99,6 +117,77 @@ impl AgentApp {
             active_cfg: initial_cfg,
             total_tokens: saved_total_tokens,
             last_prompt_tokens: 0,
+            sessions,
+            current_session_id,
+            renaming_id: None,
+            rename_buffer: String::new(),
+        }
+    }
+
+    // ✅ 新增新建会话方法
+    pub fn new_session(&mut self) {
+        let now = chrono::Local::now();
+        let id = format!("session_{}", now.timestamp_millis());
+
+        // ✅ 带日期前缀
+        let title = format!("对话 {}", now.format("%m-%d %H:%M"));
+
+        self.sessions.push(crate::storage::SessionMeta {
+            id: id.clone(),
+            title: title.clone(),
+        });
+        crate::storage::save_sessions_index(&self.sessions);
+
+        self.current_session_id = id.clone();
+        self.chat.clear();
+        self.input.clear();
+        self.status = format!("已新建 {}", title);
+        let _ = self.cmd_tx.send(AgentCommand::SwitchSession(id));
+    }
+
+    // ✅ 提交重命名的方法
+    pub fn commit_rename(&mut self) {
+        if let Some(id) = self.renaming_id.take() {
+            let new_title = self.rename_buffer.trim().to_string();
+            if !new_title.is_empty() {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    s.title = new_title;
+                    crate::storage::save_sessions_index(&self.sessions);
+                }
+            }
+        }
+    }
+
+    // ✅ 新增切换会话方法
+    pub fn switch_session(&mut self, id: &str) {
+        if self.current_session_id == id {
+            return;
+        }
+        self.current_session_id = id.to_string();
+        self.chat = crate::storage::load_session_ui(id);
+        self.status = "会话已切换".into();
+        let _ = self
+            .cmd_tx
+            .send(AgentCommand::SwitchSession(id.to_string()));
+    }
+
+    // ✅ 删除会话
+    pub fn delete_session(&mut self, id: &str) {
+        // 1. 从列表里移除
+        self.sessions.retain(|s| s.id != id);
+        crate::storage::save_sessions_index(&self.sessions);
+        crate::storage::delete_session_files(id);
+
+        // 2. 如果删除的是当前正在看的会话，需要做特殊处理
+        if self.current_session_id == id {
+            if let Some(first) = self.sessions.first() {
+                // 自动切到剩下的第一个会话
+                let next_id = first.id.clone();
+                self.switch_session(&next_id);
+            } else {
+                // 如果全删光了，自动新建一个
+                self.new_session();
+            }
         }
     }
 
@@ -127,7 +216,7 @@ impl AgentApp {
                         "MCP 已连接，共 {} 个可用工具",
                         tool_count
                     )));
-                    storage::save_json("ui_history.json", &self.chat);
+                    storage::save_session_ui(&self.current_session_id, &self.chat);
                 }
                 AgentEvent::Thinking => {
                     self.status = "思考中...".into();
@@ -158,7 +247,7 @@ impl AgentApp {
                     self.chat.push(ChatItem::Assistant(text));
                     self.is_waiting = false;
                     self.status = "就绪".into();
-                    crate::storage::save_json("ui_history.json", &self.chat);
+                    crate::storage::save_session_ui(&self.current_session_id, &self.chat);
                 }
                 // 在 poll_events 的 match 里增加：
                 AgentEvent::ToolCallPending { id, name, args } => {
@@ -172,7 +261,7 @@ impl AgentApp {
                         args,
                         status: ToolStatus::Pending,
                     });
-                    storage::save_json("ui_history.json", &self.chat);
+                    storage::save_session_ui(&self.current_session_id, &self.chat);
                 }
                 AgentEvent::ToolCallStart { id, name, .. } => {
                     self.pending_tool = None;
@@ -189,7 +278,7 @@ impl AgentApp {
                             }
                         }
                     }
-                    storage::save_json("ui_history.json", &self.chat);
+                    storage::save_session_ui(&self.current_session_id, &self.chat);
                 }
                 AgentEvent::ToolCallEnd { id, name, result } => {
                     self.pending_tool = None;
@@ -206,21 +295,21 @@ impl AgentApp {
                             }
                         }
                     }
-                    storage::save_json("ui_history.json", &self.chat);
+                    storage::save_session_ui(&self.current_session_id, &self.chat);
                 }
                 AgentEvent::Cancelled => {
                     self.streaming_text = None;
                     self.is_waiting = false;
                     self.status = "已取消".into();
                     self.chat.push(ChatItem::Status("已取消本次生成".into()));
-                    storage::save_json("ui_history.json", &self.chat);
+                    storage::save_session_ui(&self.current_session_id, &self.chat);
                 }
                 AgentEvent::Error(err) => {
                     self.streaming_text = None;
                     self.chat.push(ChatItem::Error(err));
                     self.is_waiting = false;
                     self.status = "出错".into();
-                    storage::save_json("ui_history.json", &self.chat);
+                    storage::save_session_ui(&self.current_session_id, &self.chat);
                 }
             }
         }
@@ -236,7 +325,7 @@ impl AgentApp {
         self.input.clear();
         self.is_waiting = true;
         self.status = "发送中...".into();
-        storage::save_json("ui_history.json", &self.chat);
+        storage::save_session_ui(&self.current_session_id, &self.chat);
         let _ = self.cmd_tx.send(AgentCommand::SendMessage(text));
     }
     // ✅ 在 impl AgentApp 里加这个方法

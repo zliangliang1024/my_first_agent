@@ -86,8 +86,19 @@ pub async fn agent_loop(
         tool_count: tools.len(),
     });
 
-        // ✅ 加载 LLM 的历史记忆
-    let mut history: Vec<ChatMessage> = crate::storage::load_json("llm_history.json").unwrap_or_default();
+    // 找出当前应该加载的会话
+    let mut current_session_id = String::new();
+    let sessions = crate::storage::load_sessions_index();
+    if let Some(first) = sessions.first() {
+        current_session_id = first.id.clone();
+    } else {
+        current_session_id = format!("session_{}", chrono::Local::now().timestamp_millis());
+        let meta = crate::storage::SessionMeta { id: current_session_id.clone(), title: "新对话".into() };
+        crate::storage::save_sessions_index(&[meta]);
+    }
+
+    // ✅ 加载当前会话的 LLM 历史
+    let mut history: Vec<ChatMessage> = crate::storage::load_session_llm(&current_session_id);
     
     // ✅ 清洗不合法的孤儿 tool 消息
     let mut clean_history = Vec::new();
@@ -150,7 +161,7 @@ pub async fn agent_loop(
                 cancel_flag.store(false, Ordering::SeqCst);
                 let save_point = history.len();
                 history.push(ChatMessage::user(&text));
-                storage::save_json("llm_history.json", &history); // ✅ 保存
+                storage::save_session_llm(&current_session_id, &history);; // ✅ 保存
 
                 let result: Result<()> = async {
                     loop {
@@ -252,19 +263,19 @@ pub async fn agent_loop(
                             });
                             
                             history.extend(recent_msgs);
-                            crate::storage::save_json("llm_history.json", &history);
+                            crate::storage::save_session_llm(&current_session_id, &history);;
                         }
                         if assistant.tool_calls.is_none() {
                             let text = assistant.content.clone().unwrap_or_default();
                             history.push(assistant);
-                            storage::save_json("llm_history.json", &history); // ✅ 保存
+                            storage::save_session_llm(&current_session_id, &history);; // ✅ 保存
                             let _ = event_tx.send(AgentEvent::AssistantReply(text));
                             break;
                         }
 
                         let tool_calls = assistant.tool_calls.clone().unwrap();
                         history.push(assistant);
-                        storage::save_json("llm_history.json", &history); // ✅ 保存
+                        storage::save_session_llm(&current_session_id, &history);; // ✅ 保存
 
                         for tc in &tool_calls {
                             if cancel_flag.load(Ordering::SeqCst) { anyhow::bail!("__CANCELLED__"); }
@@ -285,7 +296,7 @@ pub async fn agent_loop(
                                 });
                                 
                                 history.push(ChatMessage::tool(&tc.id, &content));
-                                crate::storage::save_json("llm_history.json", &history);
+                                crate::storage::save_session_llm(&current_session_id, &history);;
                                 
                                 continue; // 拦截成功，直接进入下一个工具，不走 MCP
                             }
@@ -377,7 +388,7 @@ pub async fn agent_loop(
                                     result: reject_msg.into()
                                 });
                                 history.push(ChatMessage::tool(&tc.id, reject_msg));
-                                crate::storage::save_json("llm_history.json", &history);
+                                crate::storage::save_session_llm(&current_session_id, &history);;
                                 continue; // 直接跳过这次工具执行
                             }
 
@@ -404,7 +415,7 @@ pub async fn agent_loop(
                                 result: result_text.clone()
                             });
                             history.push(ChatMessage::tool(&tc.id, &result_text));
-                            crate::storage::save_json("llm_history.json", &history);
+                            crate::storage::save_session_llm(&current_session_id, &history);;
                         }
                     }
                     Ok(())
@@ -415,12 +426,12 @@ pub async fn agent_loop(
                     Ok(()) => {}
                     Err(e) if e.to_string().contains("__CANCELLED__") => {
                         history.truncate(save_point);
-                        storage::save_json("llm_history.json", &history); // ✅ 回滚并保存
+                        storage::save_session_llm(&current_session_id, &history);; // ✅ 回滚并保存
                         let _ = event_tx.send(AgentEvent::Cancelled);
                     }
                     Err(e) => {
                         history.truncate(save_point);
-                        storage::save_json("llm_history.json", &history); // ✅ 回滚并保存
+                        storage::save_session_llm(&current_session_id, &history);; // ✅ 回滚并保存
                         let _ = event_tx.send(AgentEvent::Error(format!("{}", e)));
                     }
                 }
@@ -435,8 +446,18 @@ pub async fn agent_loop(
                         tool_call_id: None,
                     });
                 }
-                crate::storage::save_json("llm_history.json", &history);
+                crate::storage::save_session_llm(&current_session_id, &history);;
                 let _ = event_tx.send(AgentEvent::Status("历史已清空".into()));
+            }
+            AgentCommand::SwitchSession(id) => {
+                current_session_id = id.clone();
+                history = crate::storage::load_session_llm(&current_session_id);
+                
+                // 重新注入 System Prompt
+                if !cfg.system_prompt.is_empty() {
+                    history.insert(0, ChatMessage { role: "system".into(), content: Some(cfg.system_prompt.clone()), tool_calls: None, tool_call_id: None });
+                }
+                let _ = event_tx.send(AgentEvent::Status("会话已切换".into()));
             }
             // ✅ 忽略多余的审批指令，避免编译报错
             AgentCommand::ToolApproval(_) => {}

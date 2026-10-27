@@ -2,6 +2,7 @@ use crate::agent::AgentCommand;
 use crate::ui::app::{AgentApp, ChatItem, ToolStatus};
 use crate::ui::components::bubble::{bubble, bubble_md};
 use crate::ui::style::*;
+use chrono::{Datelike, Local, TimeZone};
 use eframe::egui::{self, Color32, Margin, RichText};
 use std::sync::atomic::Ordering;
 
@@ -9,6 +10,138 @@ impl AgentApp {
     pub fn draw_main_view(&mut self, ui: &mut egui::Ui, has_api_key: bool) -> (bool, bool) {
         let mut do_send = false;
         let mut do_exit = false;
+
+        // ✅ 绘制左侧侧边栏
+        egui::Panel::left("session_panel")
+            .resizable(false)
+            .default_size(220.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(240, 243, 248))
+                    .inner_margin(Margin::symmetric(10, 10)),
+            )
+            .show_inside(ui, |ui| {
+                ui.heading(
+                    RichText::new("会话列表")
+                        .size(16.0)
+                        .color(TEXT_COLOR)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("➕ 新建对话").size(14.0))
+                            .min_size(egui::vec2(ui.available_width(), 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.new_session();
+                }
+                ui.add_space(10.0);
+
+                // 分组逻辑
+                let now = chrono::Local::now();
+                let today = now.date_naive();
+                let yesterday = today.pred_opt().unwrap_or(today);
+                let mut today_sessions = Vec::new();
+                let mut yesterday_sessions = Vec::new();
+                let mut older_sessions = Vec::new();
+
+                for s in &self.sessions {
+                    let ts_str = s.id.strip_prefix("session_").unwrap_or(&s.id);
+                    if let Ok(ts) = ts_str.parse::<i64>() {
+                        if let Some(dt) = chrono::Local.timestamp_millis_opt(ts).single() {
+                            let date = dt.date_naive();
+                            if date == today {
+                                today_sessions.push(s.clone());
+                            } else if date == yesterday {
+                                yesterday_sessions.push(s.clone());
+                            } else {
+                                older_sessions.push(s.clone());
+                            }
+                        } else {
+                            older_sessions.push(s.clone());
+                        }
+                    } else {
+                        // 兼容旧数据或自定义 ID
+                        older_sessions.push(s.clone());
+                    }
+                }
+
+                let mut render_group = |ui: &mut egui::Ui,
+                                        title: &str,
+                                        list: &[crate::storage::SessionMeta],
+                                        app: &mut AgentApp| {
+                    if list.is_empty() {
+                        return;
+                    }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(title).color(SUBTLE_TEXT).size(12.0).strong());
+                    ui.add_space(4.0);
+
+                    for s in list {
+                        if app.renaming_id.as_deref() == Some(&s.id) {
+                            // ✅ 修复重命名输入框的布局 (固定宽度)
+                            ui.horizontal(|ui| {
+                                let response = ui.add_sized(
+                                    [140.0, 24.0], // 固定 140 宽，防止撑破侧边栏
+                                    egui::TextEdit::singleline(&mut app.rename_buffer),
+                                );
+
+                                if response.lost_focus()
+                                    || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                {
+                                    app.commit_rename();
+                                }
+                                if ui.button("✔").clicked() {
+                                    app.commit_rename();
+                                }
+                            });
+                        } else {
+                            let is_selected = s.id == app.current_session_id;
+                            let text_color = if is_selected { USER_BG } else { TEXT_COLOR };
+
+                            // ✅ 使用 available_width 让按钮自适应
+                            let btn = egui::Button::new(
+                                RichText::new(&s.title).color(text_color).size(14.0),
+                            )
+                            .fill(if is_selected {
+                                Color32::WHITE
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .min_size(egui::vec2(ui.available_width(), 30.0))
+                            .wrap();
+
+                            let response = ui.add(btn);
+                            if response.clicked() {
+                                app.switch_session(&s.id);
+                            }
+
+                            // 右键菜单
+                            response.context_menu(|ui| {
+                                if ui.button("✏️ 重命名").clicked() {
+                                    app.renaming_id = Some(s.id.clone());
+                                    app.rename_buffer = s.title.clone();
+                                    ui.close();
+                                }
+                                if ui.button("🗑️ 删除").clicked() {
+                                    app.delete_session(&s.id);
+                                    ui.close();
+                                }
+                            });
+                        }
+                    }
+                };
+
+                // 渲染列表
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    render_group(ui, "今天", &today_sessions, self);
+                    render_group(ui, "昨天", &yesterday_sessions, self);
+                    render_group(ui, "更早", &older_sessions, self);
+                });
+            });
 
         // ✅ 第一行：标题 + 右侧操作按钮
         ui.horizontal(|ui| {

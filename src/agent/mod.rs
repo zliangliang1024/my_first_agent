@@ -8,6 +8,7 @@ pub enum AgentCommand {
     ReloadConfig(Config),
     ClearHistory,       // ✅ 新增
     ToolApproval(bool), // ✅ 新增：允许或拒绝工具执行
+    SwitchSession(String), // ✅ 新增：切换会话
     Shutdown,
 }
 
