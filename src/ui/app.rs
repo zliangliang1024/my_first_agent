@@ -55,6 +55,7 @@ pub struct AgentApp {
     pub current_session_id: String,  // ✅ 当前选中的 ID
     pub renaming_id: Option<String>, // ✅ 记录正在重命名的会话 ID
     pub rename_buffer: String,       // ✅ 重命名时的输入缓冲
+    pub show_audit_log: bool, // ✅ 新增：控制日志弹窗显示
 }
 
 impl AgentApp {
@@ -121,6 +122,7 @@ impl AgentApp {
             current_session_id,
             renaming_id: None,
             rename_buffer: String::new(),
+            show_audit_log: false, // ✅ 初始化
         }
     }
 

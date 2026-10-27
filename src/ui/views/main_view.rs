@@ -20,7 +20,7 @@ impl AgentApp {
                     .fill(Color32::from_rgb(240, 243, 248))
                     .inner_margin(Margin::symmetric(10, 10)),
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.heading(
                     RichText::new("会话列表")
                         .size(16.0)
@@ -176,6 +176,17 @@ impl AgentApp {
                     .clicked()
                 {
                     self.show_settings = true;
+                }
+                // ✅ 新增：日志按钮
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("📜 日志").color(TEXT_COLOR).size(13.0))
+                            .fill(Color32::from_rgb(233, 236, 240))
+                            .corner_radius(6.0),
+                    )
+                    .clicked()
+                {
+                    self.show_audit_log = true;
                 }
                 // 清空按钮
                 if ui
@@ -543,6 +554,39 @@ impl AgentApp {
                 self.approve_tool(false); // 点外面等同拒绝
             }
         }
+
+        // ✅ 日志查看弹窗
+        if self.show_audit_log {
+            let mut open = self.show_audit_log;
+            egui::Window::new("📜 操作审计日志")
+                .open(&mut open)
+                .default_width(700.0)
+                .default_height(500.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    let log_path = crate::storage::get_storage_path("audit.log");
+                    if let Ok(content) = std::fs::read_to_string(log_path) {
+                        egui::ScrollArea::vertical()
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                // ✅ 使用 Label 并设置为可选择，同时指定等宽字体
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(content).monospace(), // 等宽字体
+                                    )
+                                    .selectable(true) // ✅ 关键：允许鼠标选中复制
+                                    .wrap(), // 自动换行
+                                );
+                            });
+                    } else {
+                        ui.label(
+                            RichText::new("暂无日志记录，去跑几个工具试试吧！").color(SUBTLE_TEXT),
+                        );
+                    }
+                });
+            self.show_audit_log = open;
+        }
+
         (do_send, do_exit)
     }
 }

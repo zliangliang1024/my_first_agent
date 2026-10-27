@@ -409,6 +409,9 @@ pub async fn agent_loop(
                                 Err(_) => "工具执行超时（超过 120 秒），已强制放弃".to_string(),
                             };
 
+                            // ✅ 新增：写入审计日志
+                            crate::storage::append_audit_log(&tc.function.name, &tc.function.arguments, &result_text);
+
                             let _ = event_tx.send(AgentEvent::ToolCallEnd {
                                 id: tc.id.clone(), // ✅
                                 name: tc.function.name.clone(),

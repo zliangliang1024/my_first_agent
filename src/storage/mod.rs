@@ -1,4 +1,4 @@
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 
 pub fn get_storage_path(filename: &str) -> PathBuf {
@@ -104,4 +104,33 @@ pub fn delete_session_files(id: &str) {
     let llm_path = get_sessions_dir().join(format!("{}_llm.json", id));
     let _ = std::fs::remove_file(ui_path);
     let _ = std::fs::remove_file(llm_path);
+}
+
+// ✅ 新增：追加审计日志
+pub fn append_audit_log(tool_name: &str, args: &str, result: &str) {
+    use std::io::Write;
+    let path = get_storage_path("audit.log");
+
+    // 格式化当前时间
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // 为了防止日志太长，截断一下结果
+    let short_result = if result.len() > 200 {
+        format!("{}...", &result[..200])
+    } else {
+        result.to_string()
+    };
+
+    let log_line = format!(
+        "[{}] Tool: {} | Args: {} | Result: {}\n",
+        now, tool_name, args, short_result
+    );
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(log_line.as_bytes());
+    }
 }
