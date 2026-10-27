@@ -277,14 +277,10 @@ pub async fn agent_loop(
                                 role: "system".into(),
                                 content: Some("[注：由于对话较长，早期的历史消息已被压缩丢弃]".into()),
                                 tool_calls: None, tool_call_id: None
-                            history.push(ChatMessage {
-                                role: "system".into(),
-                                content: Some("[注：由于对话较长，早期的历史消息已被压缩丢弃]".into()),
-                                tool_calls: None, tool_call_id: None
                             });
                             
                             history.extend(recent_msgs);
-                            crate::storage::save_session_llm(&current_session_id, &history);;
+                            crate::storage::save_session_llm(&current_session_id, &history);
                         }
                         if assistant.tool_calls.is_none() {
                             let text = assistant.content.clone().unwrap_or_default();
