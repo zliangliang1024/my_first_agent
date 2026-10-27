@@ -74,6 +74,23 @@ pub async fn agent_loop(
             }
         }
     }));
+    let mut tools = mcp_tools_to_deepseek(&tools_result.tools);
+
+        // ✅ 注入虚拟工具 read_skill，供模型查阅技能详情
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": "read_skill",
+            "description": "读取指定技能的完整 Markdown 文档。参数为技能名称。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": { "type": "string", "description": "要读取的技能名称，例如 server-health" }
+                },
+                "required": ["skill_name"]
+            }
+        }
+    }));
 
     // ✅ 新增：在启动时，利用 MCP 注解和本地策略，构建一张“工具风险字典”
     let mut tool_risks = std::collections::HashMap::new();
@@ -256,6 +273,10 @@ pub async fn agent_loop(
                             }
                             
                             // 插入一条摘要标记，告诉大模型之前有记忆被删除了
+                            history.push(ChatMessage {
+                                role: "system".into(),
+                                content: Some("[注：由于对话较长，早期的历史消息已被压缩丢弃]".into()),
+                                tool_calls: None, tool_call_id: None
                             history.push(ChatMessage {
                                 role: "system".into(),
                                 content: Some("[注：由于对话较长，早期的历史消息已被压缩丢弃]".into()),
