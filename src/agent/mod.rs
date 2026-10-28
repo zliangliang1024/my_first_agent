@@ -3,12 +3,13 @@ pub mod policy;
 pub mod skill_loader; // ✅ 新增
 use crate::config::Config;
 pub mod local_tools; // ✅ 新增
+pub mod rag;
 
 pub enum AgentCommand {
     SendMessage(String),
     ReloadConfig(Config),
-    ClearHistory,       // ✅ 新增
-    ToolApproval(bool), // ✅ 新增：允许或拒绝工具执行
+    ClearHistory,          // ✅ 新增
+    ToolApproval(bool),    // ✅ 新增：允许或拒绝工具执行
     SwitchSession(String), // ✅ 新增：切换会话
     Shutdown,
 }

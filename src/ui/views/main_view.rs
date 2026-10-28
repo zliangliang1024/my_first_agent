@@ -69,6 +69,11 @@ impl AgentApp {
                     }
                 }
 
+                // ✅ 新增：因为老会话先 push 进去，这里反转一下，让最新的在最上面
+                today_sessions.reverse();
+                yesterday_sessions.reverse();
+                older_sessions.reverse();
+
                 let mut render_group = |ui: &mut egui::Ui,
                                         title: &str,
                                         list: &[crate::storage::SessionMeta],

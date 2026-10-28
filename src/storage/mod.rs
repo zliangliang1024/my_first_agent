@@ -111,12 +111,12 @@ pub fn append_audit_log(tool_name: &str, args: &str, result: &str) {
     use std::io::Write;
     let path = get_storage_path("audit.log");
 
-    // 格式化当前时间
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    // 为了防止日志太长，截断一下结果
-    let short_result = if result.len() > 200 {
-        format!("{}...", &result[..200])
+    // ✅ 修复：按“字符”截断，而不是按“字节”
+    let short_result = if result.chars().count() > 200 {
+        let s: String = result.chars().take(200).collect();
+        format!("{}...", s)
     } else {
         result.to_string()
     };

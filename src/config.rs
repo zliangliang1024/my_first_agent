@@ -9,13 +9,15 @@ pub struct Config {
     pub deepseek_url: String,
     #[serde(default = "default_model")]
     pub model: String,
-
     // ✅ 使用 Vec 支持多个 MCP 路径
     #[serde(default = "default_mcp_exes")]
     pub mcp_exes: Vec<String>,
-
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default)]
+    pub embedding_api_key: String,
+    #[serde(default = "default_embedding_url")]
+    pub embedding_url: String,
 }
 
 fn default_url() -> String {
@@ -31,6 +33,10 @@ fn default_mcp_exes() -> Vec<String> {
     vec![r"C:\Users\zlian\.dbx\bin\dbx-mcp.exe".to_string()]
 }
 
+fn default_embedding_url() -> String {
+    "https://open.bigmodel.cn/api/paas/v4/embeddings".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -38,6 +44,8 @@ impl Default for Config {
             deepseek_url: default_url(),
             model: default_model(),
             mcp_exes: default_mcp_exes(),
+            embedding_api_key:"".into(),
+            embedding_url:default_embedding_url(),
             system_prompt: "你是一个专业的运维助手 Agent，可以调用 MCP 工具在本地开发机和远程 Linux 服务器上执行命令。\n\n行为准则：\n1. 优先调用工具获取真实数据，不要凭猜测回答。\n2. 涉及删除、修改、sudo 等危险操作，先向用户说明你要做什么，得到确认再执行。\n3. 回复使用中文，重要数据用表格或列表展示。".into(),
         }
     }
@@ -112,6 +120,12 @@ impl Config {
             cfg.mcp_exes = defaults.mcp_exes.clone();
             changed = true;
         }
+
+        if cfg.embedding_url.trim().is_empty() {
+            cfg.embedding_url = defaults.embedding_url;
+            changed = true;
+        }
+        // embedding_api_key 允许为空（不开启 RAG），所以不用兜底
 
         if cfg.system_prompt.trim().is_empty() {
             cfg.system_prompt = defaults.system_prompt;
