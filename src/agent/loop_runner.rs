@@ -1,24 +1,41 @@
 use anyhow::Result;
 use rmcp::model::CallToolRequestParams;
 use rmcp::{ServiceExt, transport::TokioChildProcess};
-use serde_json::{Value, json};
-use std::sync::Arc;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use tokio::process::Command;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 
-use super::{AgentCommand, AgentEvent};
 use crate::config::Config;
 use crate::llm::deepseek::call_deepseek_stream;
 use crate::llm::{ChatMessage, StreamDelta};
-use crate::storage; // ✅ 引入 storage
+use crate::agent::policy::RiskLevel;
+use super::{AgentCommand, AgentEvent};
 
-fn mcp_tools_to_deepseek(tools: &[rmcp::model::Tool]) -> Vec<Value> {
-    tools.iter().map(|t| json!({
-        "type": "function",
-        "function": { "name": t.name, "description": t.description.clone().unwrap_or_default(), "parameters": t.input_schema }
-    })).collect()
+fn sanitize_history(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut clean = Vec::new();
+    let mut valid_tool_ids = std::collections::HashSet::new();
+
+    for msg in history {
+        if msg.role == "assistant" {
+            if let Some(tcs) = &msg.tool_calls {
+                for tc in tcs { valid_tool_ids.insert(tc.id.clone()); }
+            }
+            clean.push(msg.clone());
+        } else if msg.role == "tool" {
+            if let Some(id) = &msg.tool_call_id {
+                if valid_tool_ids.contains(id) {
+                    clean.push(msg.clone());
+                    valid_tool_ids.remove(id);
+                }
+            }
+        } else {
+            clean.push(msg.clone());
+        }
+    }
+    clean
 }
 
 pub async fn agent_loop(
@@ -29,156 +46,111 @@ pub async fn agent_loop(
 ) {
     let _ = event_tx.send(AgentEvent::Status("正在连接 MCP...".into()));
 
-    if cfg.dbx_exe.trim().is_empty() {
-        let _ = event_tx.send(AgentEvent::Error("未配置 DBX 路径，请在设置中填写".into()));
+    if cfg.mcp_exes.is_empty() {
+        let _ = event_tx.send(AgentEvent::Error("未配置任何 MCP 路径".into()));
         return;
     }
 
-    let transport = match TokioChildProcess::new(Command::new(&cfg.dbx_exe)) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = event_tx.send(AgentEvent::Error(format!("启动失败: {}", e)));
-            return;
-        }
-    };
-    let client = match ().serve(transport).await {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = event_tx.send(AgentEvent::Error(format!("初始化失败: {}", e)));
-            return;
-        }
-    };
+    // 存储 所有连接的 MCP 客户端
+    let mut mcp_clients: HashMap<String, rmcp::service::RunningService<rmcp::RoleClient, ()>> = HashMap::new();
+    let mut all_tools: Vec<Value> = Vec::new();
+    let mut tool_risks = HashMap::new();
 
-    let tools_result = match client.list_tools(None).await {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = event_tx.send(AgentEvent::Error(format!("获取工具失败: {}", e)));
-            return;
+    // 1. 加载多 MCP
+    for exe_path in &cfg.mcp_exes {
+        let prefix = std::path::Path::new(exe_path).file_stem().and_then(|s| s.to_str()).unwrap_or("mcp").replace("-mcp", "");
+        let _ = event_tx.send(AgentEvent::Status(format!("正在连接 {}...", prefix)));
+
+        let mut cmd = tokio::process::Command::new(exe_path);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+
+        let transport = match TokioChildProcess::new(cmd) {
+            Ok(t) => t,
+            Err(e) => { let _ = event_tx.send(AgentEvent::Error(format!("启动 {} 失败: {}", prefix, e))); continue; }
+        };
+        let client = match ().serve(transport).await {
+            Ok(c) => c,
+            Err(e) => { let _ = event_tx.send(AgentEvent::Error(format!("初始化 {} 失败: {}", prefix, e))); continue; }
+        };
+        let tools_result = match client.list_tools(None).await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        for t in &tools_result.tools {
+            let new_name = format!("{}__{}", prefix, t.name);
+            all_tools.push(json!({
+                "type": "function",
+                "function": { "name": new_name, "description": t.description.clone().unwrap_or_default(), "parameters": t.input_schema }
+            }));
+            tool_risks.insert(new_name, crate::agent::policy::evaluate_tool_risk(t));
         }
-    };
-
-    let mut tools = mcp_tools_to_deepseek(&tools_result.tools);
-
-        // ✅ 注入虚拟工具 read_skill，供模型查阅技能详情
-    tools.push(json!({
-        "type": "function",
-        "function": {
-            "name": "read_skill",
-            "description": "读取指定技能的完整 Markdown 文档。参数为技能名称。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_name": { "type": "string", "description": "要读取的技能名称，例如 server-health" }
-                },
-                "required": ["skill_name"]
-            }
-        }
-    }));
-    let mut tools = mcp_tools_to_deepseek(&tools_result.tools);
-
-        // ✅ 注入虚拟工具 read_skill，供模型查阅技能详情
-    tools.push(json!({
-        "type": "function",
-        "function": {
-            "name": "read_skill",
-            "description": "读取指定技能的完整 Markdown 文档。参数为技能名称。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_name": { "type": "string", "description": "要读取的技能名称，例如 server-health" }
-                },
-                "required": ["skill_name"]
-            }
-        }
-    }));
-
-    // ✅ 新增：在启动时，利用 MCP 注解和本地策略，构建一张“工具风险字典”
-    let mut tool_risks = std::collections::HashMap::new();
-    for t in &tools_result.tools {
-        let risk = crate::agent::policy::evaluate_tool_risk(t);
-        tool_risks.insert(t.name.to_string(), risk);
+        mcp_clients.insert(prefix, client);
     }
 
-    let _ = event_tx.send(AgentEvent::Ready {
-        tool_count: tools.len(),
-    });
+    // 2. 注入本地工具
+    all_tools.extend(crate::agent::local_tools::get_local_tools());
+    tool_risks.insert("get_current_time".into(), RiskLevel::Low);
+    tool_risks.insert("execute_local_shell".into(), RiskLevel::High);
 
-    // 找出当前应该加载的会话
+    // 3. 注入技能工具 (Phase 4)
+    let skills = crate::agent::skill_loader::scan_skills();
+    all_tools.extend(crate::agent::skill_loader::get_skill_tools(&skills));
+    for s in &skills {
+        tool_risks.insert(format!("skill_{}", s.name.replace("-", "_")), RiskLevel::Low);
+    }
+
+    let _ = event_tx.send(AgentEvent::Ready { tool_count: all_tools.len() });
+
     let mut current_session_id = String::new();
     let sessions = crate::storage::load_sessions_index();
-    if let Some(first) = sessions.first() {
-        current_session_id = first.id.clone();
-    } else {
+    if let Some(first) = sessions.first() { current_session_id = first.id.clone(); } 
+    else {
         current_session_id = format!("session_{}", chrono::Local::now().timestamp_millis());
         let meta = crate::storage::SessionMeta { id: current_session_id.clone(), title: "新对话".into() };
         crate::storage::save_sessions_index(&[meta]);
     }
 
-    // ✅ 加载当前会话的 LLM 历史
-    let mut history: Vec<ChatMessage> = crate::storage::load_session_llm(&current_session_id);
-    
-    // ✅ 清洗不合法的孤儿 tool 消息
-    let mut clean_history = Vec::new();
-    let mut valid_tool_ids = std::collections::HashSet::new();
-    
-    for msg in history {
-        if msg.role == "assistant" {
-            if let Some(tcs) = &msg.tool_calls {
-                for tc in tcs { valid_tool_ids.insert(tc.id.clone()); }
-            }
-            clean_history.push(msg);
-        } else if msg.role == "tool" {
-            // ✅ 先 clone 出来，断绝与 msg 的借用关系
-            let id_opt = msg.tool_call_id.clone();
-            
-            if let Some(id) = id_opt {
-                if valid_tool_ids.contains(&id) {
-                    valid_tool_ids.remove(&id);
-                    // 现在没有借用冲突了，放心 push
-                    clean_history.push(msg);
-                }
-                // 如果 valid_tool_ids 里没有，说明是孤儿消息，直接丢弃
-            }
-        } else {
-            clean_history.push(msg);
-        }
-    }
-    history = clean_history;
-
-    // ✅ 动态加载项目规则和技能列表
-    let agent_context = crate::agent::skill_loader::load_agent_context();
-
-    let mut final_system_prompt = cfg.system_prompt.clone();
-    if !agent_context.is_empty() {
-        final_system_prompt = format!("{}\n\n{}", final_system_prompt, agent_context);
+    let mut history = crate::storage::load_session_llm(&current_session_id);
+    if !cfg.system_prompt.is_empty() {
+        history.insert(0, ChatMessage { role: "system".into(), content: Some(cfg.system_prompt.clone()), tool_calls: None, tool_call_id: None });
     }
 
-    if !final_system_prompt.is_empty() {
-        if history.is_empty() || history[0].role != "system" {
-            history.insert(0, ChatMessage { role: "system".into(), content: Some(final_system_prompt), tool_calls: None, tool_call_id: None });
-        } else {
-            // 如果已经有 system，更新它的内容
-            history[0].content = Some(final_system_prompt);
-        }
-    }
-
+    // 主循环
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             AgentCommand::Shutdown => break,
             AgentCommand::ReloadConfig(new_cfg) => {
                 cfg = new_cfg;
-                let _ = event_tx.send(AgentEvent::Status("配置已更新并生效".into()));
+                let _ = event_tx.send(AgentEvent::Status("配置已更新，需重启生效".into()));
             }
+            AgentCommand::ClearHistory => {
+                history.clear();
+                if !cfg.system_prompt.is_empty() {
+                    history.push(ChatMessage { role: "system".into(), content: Some(cfg.system_prompt.clone()), tool_calls: None, tool_call_id: None });
+                }
+                crate::storage::save_session_llm(&current_session_id, &history);
+                let _ = event_tx.send(AgentEvent::Status("历史已清空".into()));
+            }
+            AgentCommand::SwitchSession(id) => {
+                current_session_id = id.clone();
+                history = crate::storage::load_session_llm(&current_session_id);
+                if !cfg.system_prompt.is_empty() {
+                    history.insert(0, ChatMessage { role: "system".into(), content: Some(cfg.system_prompt.clone()), tool_calls: None, tool_call_id: None });
+                }
+                let _ = event_tx.send(AgentEvent::Status("会话已切换".into()));
+            }
+            AgentCommand::ToolApproval(_) => {} // 在内部 select! 处理
             AgentCommand::SendMessage(text) => {
                 if cfg.deepseek_api_key.trim().is_empty() {
                     let _ = event_tx.send(AgentEvent::Error("未配置 API Key".into()));
                     continue;
                 }
-
                 cancel_flag.store(false, Ordering::SeqCst);
                 let save_point = history.len();
                 history.push(ChatMessage::user(&text));
-                storage::save_session_llm(&current_session_id, &history);; // ✅ 保存
+                crate::storage::save_session_llm(&current_session_id, &history);
 
                 let result: Result<()> = async {
                     loop {
@@ -188,181 +160,63 @@ pub async fn agent_loop(
                         let cancel_for_llm = cancel_flag.clone();
 
                         let mut attempt = 1;
-                        let max_attempts = 3;
                         let mut assistant_opt = None;
-                        let mut usage_opt = None; // ✅ 新增
+                        let mut usage_opt = None;
 
-                        while attempt <= max_attempts {
-                        // ✅ 每次请求前，强制清洗历史里的“孤儿 tool”消息
-                        let mut valid_tool_ids = std::collections::HashSet::new();
-                        let mut clean_history = Vec::new();
-                            
-                        for msg in &history {
-                            if msg.role == "assistant" {
-                                if let Some(tcs) = &msg.tool_calls {
-                                    for tc in tcs { valid_tool_ids.insert(tc.id.clone()); }
-                                }
-                                clean_history.push(msg.clone());
-                            } else if msg.role == "tool" {
-                                if let Some(id) = &msg.tool_call_id {
-                                    // 只有当这个 tool_id 在前面出现过，才保留它
-                                    if valid_tool_ids.contains(id) {
-                                        clean_history.push(msg.clone());
-                                        valid_tool_ids.remove(id);
-                                    }
-                                }
-                            } else {
-                                clean_history.push(msg.clone());
-                            }
-                        }
-
-                            // 使用清洗后的历史去请求
-                            let res = call_deepseek_stream(&cfg, &clean_history, &tools, cancel_for_llm.clone(), {
+                        while attempt <= 3 {
+                            let safe_history = sanitize_history(&history);
+                            let res = call_deepseek_stream(&cfg, &safe_history, &all_tools, cancel_for_llm.clone(), {
                                 let tx = tx_delta.clone();
-                                move |delta| { 
-                                    match delta {
-                                        StreamDelta::Content(s) => { let _ = tx.send(AgentEvent::AssistantDelta(s)); }
-                                    }
-                                }
+                                move |delta| { if let StreamDelta::Content(s) = delta { let _ = tx.send(AgentEvent::AssistantDelta(s)); } }
                             }).await;
 
                             match res {
-                                // ...
-                                Ok((msg,usage)) => {
-                                    assistant_opt = Some(msg);
-                                    usage_opt = usage; // ✅ 记录
-                                    break;
-                                }
-                                                                Err(e) => {
+                                Ok((msg, usage)) => { assistant_opt = Some(msg); usage_opt = usage; break; }
+                                Err(e) => {
                                     let err_str = e.to_string();
-                                    
-                                    // 用户取消，直接退出
-                                    if err_str.contains("__CANCELLED__") {
-                                        anyhow::bail!("__CANCELLED__");
-                                    }
-                                    
-                                    // ✅ 遇到 400 Bad Request (参数/格式错误)，重试也没用，直接报错
-                                    if err_str.contains("400") {
-                                        anyhow::bail!("请求格式错误 (400)，请清空历史记录后重试。详情: {}", err_str);
-                                    }
-
-                                    // 只有非 400 的错误（如超时、断网）才重试
-                                    if attempt == max_attempts {
-                                        anyhow::bail!("重试失败: {}", err_str);
-                                    }
-                                    
-                                    let _ = event_tx.send(AgentEvent::Status(format!("网络或服务器异常，重试 ({}/{})...", attempt, max_attempts)));
+                                    if err_str.contains("__CANCELLED__") { anyhow::bail!("__CANCELLED__"); }
+                                    if err_str.contains("400") { anyhow::bail!("请求格式错误(400): {}", err_str); }
+                                    if attempt == 3 { anyhow::bail!("重试失败: {}", err_str); }
+                                    let _ = event_tx.send(AgentEvent::Status(format!("网络失败，重试 ({}/3)...", attempt)));
                                     tokio::time::sleep(Duration::from_secs(2_u64.pow(attempt - 1))).await;
                                     attempt += 1;
                                 }
                             }
                         }
 
-                        // ✅ 发出 Token 统计事件
+                        let assistant = assistant_opt.expect("重试错误");
+                        // 发送 token 统计
                         if let Some(u) = usage_opt {
-                            let _ = event_tx.send(AgentEvent::TokenUsage {
-                                total_tokens: u.total_tokens,
-                                prompt_tokens: u.prompt_tokens
-                            });
+                            let _ = event_tx.send(AgentEvent::TokenUsage { total_tokens: u.total_tokens, prompt_tokens: u.prompt_tokens });
                         }
 
-                        let assistant = assistant_opt.expect("重试逻辑错误");
-                                                // ✅ 上下文压缩逻辑：保留 System Prompt 和最近 20 条消息
-                        if history.len() > 25 {
-                            let _ = event_tx.send(AgentEvent::Status("上下文过长，正在压缩早期记忆...".into()));
-                            
-                            // 提取 System Prompt (如果有)
-                            let system_msg = if !history.is_empty() && history[0].role == "system" {
-                                Some(history[0].clone())
-                            } else {
-                                None
-                            };
-                            
-                            // 只保留最近的 16 条消息
-                            let mut recent_msgs: Vec<ChatMessage> = history.iter().rev().take(16).cloned().collect::<Vec<_>>().into_iter().rev().collect();
-
-                            // ✅ 防止压缩后开头是孤儿 tool 消息
-                            while !recent_msgs.is_empty() && recent_msgs[0].role == "tool" {
-                                recent_msgs.remove(0);
-                            }
-                            
-                            history.clear();
-                            if let Some(sys) = system_msg {
-                                history.push(sys);
-                            }
-                            
-                            // 插入一条摘要标记，告诉大模型之前有记忆被删除了
-                            history.push(ChatMessage {
-                                role: "system".into(),
-                                content: Some("[注：由于对话较长，早期的历史消息已被压缩丢弃]".into()),
-                                tool_calls: None, tool_call_id: None
-                            });
-                            
-                            history.extend(recent_msgs);
-                            crate::storage::save_session_llm(&current_session_id, &history);
-                        }
                         if assistant.tool_calls.is_none() {
                             let text = assistant.content.clone().unwrap_or_default();
                             history.push(assistant);
-                            storage::save_session_llm(&current_session_id, &history);; // ✅ 保存
+                            crate::storage::save_session_llm(&current_session_id, &history);
                             let _ = event_tx.send(AgentEvent::AssistantReply(text));
                             break;
                         }
 
                         let tool_calls = assistant.tool_calls.clone().unwrap();
                         history.push(assistant);
-                        storage::save_session_llm(&current_session_id, &history);; // ✅ 保存
+                        crate::storage::save_session_llm(&current_session_id, &history);
 
                         for tc in &tool_calls {
                             if cancel_flag.load(Ordering::SeqCst) { anyhow::bail!("__CANCELLED__"); }
-
-                            // ✅ 拦截本地虚拟工具 read_skill
-                            if tc.function.name == "read_skill" {
-                                let _ = event_tx.send(AgentEvent::ToolCallStart {
-                                    id: tc.id.clone(), name: tc.function.name.clone(), args: tc.function.arguments.clone()
-                                });
-                                
-                                let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
-                                let skill_name = args.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
-                                
-                                let content = crate::agent::skill_loader::read_skill_file(skill_name);
-                                
-                                let _ = event_tx.send(AgentEvent::ToolCallEnd {
-                                    id: tc.id.clone(), name: tc.function.name.clone(), result: content.clone()
-                                });
-                                
-                                history.push(ChatMessage::tool(&tc.id, &content));
-                                crate::storage::save_session_llm(&current_session_id, &history);;
-                                
-                                continue; // 拦截成功，直接进入下一个工具，不走 MCP
-                            }
-
-                            // ✅ 从字典里查出该工具的风险等级
-                            let risk = *tool_risks.get(&tc.function.name).unwrap_or(&crate::agent::policy::RiskLevel::High);
                             
-                            // 1. 明确被拉黑的工具
-                            if let crate::agent::policy::RiskLevel::Deny = risk {
-                                let reject_msg = "系统拦截：该工具已被策略模块拉黑，禁止执行。";
-                                let _ = event_tx.send(AgentEvent::ToolCallEnd {
-                                    id: tc.id.clone(), // ✅
-                                    name: tc.function.name.clone(),
-                                    result: reject_msg.into()
-                                });
+                            let risk = *tool_risks.get(&tc.function.name).unwrap_or(&RiskLevel::High);
+                            if let RiskLevel::Deny = risk {
+                                let reject_msg = "系统拦截：策略禁止该工具。";
+                                let _ = event_tx.send(AgentEvent::ToolCallEnd { id: tc.id.clone(), name: tc.function.name.clone(), result: reject_msg.into() });
                                 history.push(ChatMessage::tool(&tc.id, reject_msg));
+                                crate::storage::save_session_llm(&current_session_id, &history);
                                 continue;
                             }
 
-                            // 2. 只有 High 需要审批
-                            let mut approved = risk == crate::agent::policy::RiskLevel::Low;
-
-                            if risk == crate::agent::policy::RiskLevel::High {
-                                // 挂起审批逻辑
-                                let _ = event_tx.send(AgentEvent::ToolCallPending {
-                                    id: tc.id.clone(), // ✅
-                                    name: tc.function.name.clone(),
-                                    args: tc.function.arguments.clone()
-                                });
-
+                            let mut approved = risk == RiskLevel::Low;
+                            if risk == RiskLevel::High {
+                                let _ = event_tx.send(AgentEvent::ToolCallPending { id: tc.id.clone(), name: tc.function.name.clone(), args: tc.function.arguments.clone() });
                                 loop {
                                     tokio::select! {
                                         _ = tokio::time::sleep(Duration::from_millis(50)) => {
@@ -372,134 +226,78 @@ pub async fn agent_loop(
                                             match cmd {
                                                 Some(AgentCommand::ToolApproval(a)) => { approved = a; break; }
                                                 Some(AgentCommand::Shutdown) => std::process::exit(0),
-                                                _ => {}
+                                                _ => {} 
                                             }
                                         }
                                     }
                                 }
                             }
 
-                            // 3. 被拒绝直接跳过
                             if !approved {
-                                let reject_msg = "用户拒绝执行该工具调用。";
-                                let _ = event_tx.send(AgentEvent::ToolCallEnd {
-                                    id: tc.id.clone(), // ✅
-                                    name: tc.function.name.clone(),
-                                    result: reject_msg.into()
-                                });
+                                let reject_msg = "用户拒绝执行该工具。";
+                                let _ = event_tx.send(AgentEvent::ToolCallEnd { id: tc.id.clone(), name: tc.function.name.clone(), result: reject_msg.into() });
                                 history.push(ChatMessage::tool(&tc.id, reject_msg));
+                                crate::storage::save_session_llm(&current_session_id, &history);
                                 continue;
                             }
-                            
-                            // 1. 发送 Pending 事件，挂起等待审批
-                            let _ = event_tx.send(AgentEvent::ToolCallPending {
-                                id: tc.id.clone(), // ✅
-                                name: tc.function.name.clone(),
-                                args: tc.function.arguments.clone()
-                            });
 
-                            // 2. 阻塞等待 UI 发送 ToolApproval 指令
-                            let mut approved = false;
-                            loop {
-                                tokio::select! {
-                                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                                        if cancel_flag.load(Ordering::SeqCst) { anyhow::bail!("__CANCELLED__"); }
-                                    }
-                                    cmd = cmd_rx.recv() => {
-                                        match cmd {
-                                            Some(AgentCommand::ToolApproval(a)) => { approved = a; break; }
-                                            Some(AgentCommand::Shutdown) => std::process::exit(0),
-                                            _ => {} // 忽略其他指令
-                                        }
-                                    }
+                            let _ = event_tx.send(AgentEvent::ToolCallStart { id: tc.id.clone(), name: tc.function.name.clone(), args: tc.function.arguments.clone() });
+                            let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
+                            let mut result_text = String::new();
+
+                            // A. 本地工具
+                            if ["get_current_time", "execute_local_shell"].contains(&tc.function.name.as_str()) {
+                                let (content, _) = crate::agent::local_tools::execute_local_tool(&tc.function.name, &args);
+                                result_text = content;
+                            } 
+                            // B. 技能
+                            else if tc.function.name.starts_with("skill_") {
+                                let skill_dir_name = tc.function.name.trim_start_matches("skill_").replace("_", "-");
+                                result_text = crate::agent::skill_loader::read_skill_file(&skill_dir_name);
+                            } 
+                            // C. MCP
+                            else {
+                                let mut parts = tc.function.name.splitn(2, "__");
+                                let prefix = parts.next().unwrap_or("");
+                                let real_name = parts.next().unwrap_or(&tc.function.name);
+                                if let Some(client) = mcp_clients.get(prefix) {
+                                    let mut params = CallToolRequestParams::new(real_name.to_string());
+                                    if let Some(map) = args.as_object() { params = params.with_arguments(map.clone()); }
+                                    result_text = match timeout(Duration::from_secs(120), client.call_tool(params)).await {
+                                        Ok(Ok(r)) => serde_json::to_string(&r).unwrap_or_default(),
+                                        Ok(Err(e)) => format!("工具执行失败: {}", e),
+                                        Err(_) => "工具执行超时".to_string(),
+                                    };
+                                } else {
+                                    result_text = "未知的 MCP 服务器前缀".to_string();
                                 }
                             }
 
-                            // 3. 如果被拒绝，伪造一个拒绝结果写入历史
-                            if !approved {
-                                let reject_msg = "用户拒绝执行该工具调用。";
-                                let _ = event_tx.send(AgentEvent::ToolCallEnd {
-                                    id: tc.id.clone(), // ✅
-                                    name: tc.function.name.clone(),
-                                    result: reject_msg.into()
-                                });
-                                history.push(ChatMessage::tool(&tc.id, reject_msg));
-                                crate::storage::save_session_llm(&current_session_id, &history);;
-                                continue; // 直接跳过这次工具执行
-                            }
-
-                            // 4. 已批准，正式执行
-                            let _ = event_tx.send(AgentEvent::ToolCallStart {
-                                id: tc.id.clone(), // ✅
-                                name: tc.function.name.clone(),
-                                args: tc.function.arguments.clone()
-                            });
-                            
-                            let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
-                            let mut params = CallToolRequestParams::new(tc.function.name.clone());
-                            if let Some(map) = args.as_object() { params = params.with_arguments(map.clone()); }
-
-                            let result_text = match timeout(Duration::from_secs(120), client.call_tool(params)).await {
-                                Ok(Ok(r)) => serde_json::to_string(&r).unwrap_or_default(),
-                                Ok(Err(e)) => format!("工具执行失败: {}", e),
-                                Err(_) => "工具执行超时（超过 120 秒），已强制放弃".to_string(),
-                            };
-
-                            // ✅ 新增：写入审计日志
+                            // 审计日志
                             crate::storage::append_audit_log(&tc.function.name, &tc.function.arguments, &result_text);
 
-                            let _ = event_tx.send(AgentEvent::ToolCallEnd {
-                                id: tc.id.clone(), // ✅
-                                name: tc.function.name.clone(),
-                                result: result_text.clone()
-                            });
+                            let _ = event_tx.send(AgentEvent::ToolCallEnd { id: tc.id.clone(), name: tc.function.name.clone(), result: result_text.clone() });
                             history.push(ChatMessage::tool(&tc.id, &result_text));
-                            crate::storage::save_session_llm(&current_session_id, &history);;
+                            crate::storage::save_session_llm(&current_session_id, &history);
                         }
                     }
                     Ok(())
-                }
-                .await;
+                }.await;
 
                 match result {
                     Ok(()) => {}
                     Err(e) if e.to_string().contains("__CANCELLED__") => {
                         history.truncate(save_point);
-                        storage::save_session_llm(&current_session_id, &history);; // ✅ 回滚并保存
+                        crate::storage::save_session_llm(&current_session_id, &history);
                         let _ = event_tx.send(AgentEvent::Cancelled);
                     }
                     Err(e) => {
                         history.truncate(save_point);
-                        storage::save_session_llm(&current_session_id, &history);; // ✅ 回滚并保存
+                        crate::storage::save_session_llm(&current_session_id, &history);
                         let _ = event_tx.send(AgentEvent::Error(format!("{}", e)));
                     }
                 }
             }
-            AgentCommand::ClearHistory => {
-                history.clear();
-                if !cfg.system_prompt.is_empty() {
-                    history.push(ChatMessage {
-                        role: "system".into(),
-                        content: Some(cfg.system_prompt.clone()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
-                crate::storage::save_session_llm(&current_session_id, &history);;
-                let _ = event_tx.send(AgentEvent::Status("历史已清空".into()));
-            }
-            AgentCommand::SwitchSession(id) => {
-                current_session_id = id.clone();
-                history = crate::storage::load_session_llm(&current_session_id);
-                
-                // 重新注入 System Prompt
-                if !cfg.system_prompt.is_empty() {
-                    history.insert(0, ChatMessage { role: "system".into(), content: Some(cfg.system_prompt.clone()), tool_calls: None, tool_call_id: None });
-                }
-                let _ = event_tx.send(AgentEvent::Status("会话已切换".into()));
-            }
-            // ✅ 忽略多余的审批指令，避免编译报错
-            AgentCommand::ToolApproval(_) => {}
         }
     }
 }

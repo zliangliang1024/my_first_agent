@@ -1,33 +1,32 @@
+use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
-pub fn load_agent_context() -> String {
-    let mut context = String::new();
+// 提取出来的技能元数据
+pub struct SkillMeta {
+    pub name: String,
+    pub description: String,
+}
 
-    // 1. 读取 AGENTS.md
-    if let Ok(content) = fs::read_to_string("AGENTS.md") {
-        context.push_str(&format!("\n# 项目规则 (AGENTS.md)\n{}\n", content));
-    }
-
-    // 2. 扫描 skills/ 目录
+// 扫描本地 skills 文件夹，获取所有技能
+pub fn scan_skills() -> Vec<SkillMeta> {
+    let mut skills = Vec::new();
     let skills_dir = Path::new("skills");
+    
     if skills_dir.exists() && skills_dir.is_dir() {
-        context.push_str("\n# 可用技能手册\n");
-        context.push_str("你可以使用工具 `read_skill` 来读取以下技能的完整内容：\n\n");
-
         if let Ok(entries) = fs::read_dir(skills_dir) {
             for entry in entries.flatten() {
                 let skill_md = entry.path().join("SKILL.md");
                 if skill_md.exists() {
                     if let Ok(content) = fs::read_to_string(&skill_md) {
-                        // 简单的提取 YAML Frontmatter 中的 name 和 description
                         let mut name = String::new();
                         let mut desc = String::new();
                         let mut in_frontmatter = false;
 
+                        // 简单解析 YAML Frontmatter
                         for line in content.lines() {
                             if line.trim() == "---" {
-                                if in_frontmatter { break; } // Frontmatter 结束
+                                if in_frontmatter { break; } // 遇到第二个 --- 结束
                                 in_frontmatter = true;
                                 continue;
                             }
@@ -41,23 +40,37 @@ pub fn load_agent_context() -> String {
                         }
 
                         if !name.is_empty() {
-                            context.push_str(&format!("- **{}**: {}\n", name, desc));
+                            skills.push(SkillMeta { name, description: desc });
                         }
                     }
                 }
             }
         }
     }
-
-    context
+    skills
 }
 
-// 读取某个具体技能的完整内容
+// ✅ 新增：将技能转化为大模型能看懂的虚拟工具列表
+pub fn get_skill_tools(skills: &[SkillMeta]) -> Vec<Value> {
+    skills.iter().map(|s| {
+        json!({
+            "type": "function",
+            "function": {
+                // 工具名加上 skill_ 前缀，并把中划线转成下划线（因为 OpenAI 规范工具名只能用字母数字下划线）
+                "name": format!("skill_{}", s.name.replace("-", "_")),
+                "description": format!("[技能] {}", s.description),
+                "parameters": { "type": "object", "properties": {} } // 技能不需要传参
+            }
+        })
+    }).collect()
+}
+
+// 读取某个具体技能的完整 SOP 内容（留给执行时用）
 pub fn read_skill_file(skill_name: &str) -> String {
     let path = format!("skills/{}/SKILL.md", skill_name);
     if let Ok(content) = fs::read_to_string(path) {
         content
     } else {
-        format!("未找到名为 {} 的技能文件。", skill_name)
+        format!("未找到名为 {} 的技能文件，请检查 skills 目录。", skill_name)
     }
 }

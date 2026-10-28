@@ -175,6 +175,8 @@ impl AgentApp {
                     )
                     .clicked()
                 {
+                    // ✅ 打开弹窗时，把 Vec 转成带换行符的 String
+                    self.edit_mcp_exes_text = self.edit_cfg.mcp_exes.join("\n");
                     self.show_settings = true;
                 }
                 // ✅ 新增：日志按钮
@@ -486,7 +488,7 @@ impl AgentApp {
             // 2. 用一个临时变量记录用户的操作
             let mut action: Option<bool> = None;
 
-            let modal = egui::Modal::new(egui::Id::new("tool_approval_modal"))
+            let modal = egui::Modal::new(egui::Id::unique("tool_approval_modal"))
                 .frame(
                     egui::Frame::new()
                         .fill(Color32::WHITE)

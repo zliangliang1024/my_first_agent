@@ -56,6 +56,7 @@ pub struct AgentApp {
     pub renaming_id: Option<String>, // ✅ 记录正在重命名的会话 ID
     pub rename_buffer: String,       // ✅ 重命名时的输入缓冲
     pub show_audit_log: bool, // ✅ 新增：控制日志弹窗显示
+    pub edit_mcp_exes_text: String, // ✅ 专门用于多行文本编辑
 }
 
 impl AgentApp {
@@ -123,6 +124,7 @@ impl AgentApp {
             renaming_id: None,
             rename_buffer: String::new(),
             show_audit_log: false, // ✅ 初始化
+            edit_mcp_exes_text: String::new(), // 初始化
         }
     }
 

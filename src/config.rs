@@ -9,13 +9,27 @@ pub struct Config {
     pub deepseek_url: String,
     #[serde(default = "default_model")]
     pub model: String,
-    pub dbx_exe: String,
+
+    // ✅ 使用 Vec 支持多个 MCP 路径
+    #[serde(default = "default_mcp_exes")]
+    pub mcp_exes: Vec<String>,
+
     #[serde(default)]
     pub system_prompt: String,
 }
 
-fn default_url() -> String { "https://api.deepseek.com/chat/completions".into() }
-fn default_model() -> String { "deepseek-chat".into() }
+fn default_url() -> String {
+    "https://api.deepseek.com/chat/completions".into()
+}
+
+fn default_model() -> String {
+    "deepseek-chat".into()
+}
+
+fn default_mcp_exes() -> Vec<String> {
+    // 使用 r"" 原始字符串，反斜杠不需要转义
+    vec![r"C:\Users\zlian\.dbx\bin\dbx-mcp.exe".to_string()]
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -23,7 +37,7 @@ impl Default for Config {
             deepseek_api_key: "".into(),
             deepseek_url: default_url(),
             model: default_model(),
-            dbx_exe: r"C:\Users\zlian\.dbx\bin\dbx-mcp.exe".into(),
+            mcp_exes: default_mcp_exes(),
             system_prompt: "你是一个专业的运维助手 Agent，可以调用 MCP 工具在本地开发机和远程 Linux 服务器上执行命令。\n\n行为准则：\n1. 优先调用工具获取真实数据，不要凭猜测回答。\n2. 涉及删除、修改、sudo 等危险操作，先向用户说明你要做什么，得到确认再执行。\n3. 回复使用中文，重要数据用表格或列表展示。".into(),
         }
     }
@@ -43,48 +57,69 @@ impl Config {
 
     pub fn load() -> Result<Self> {
         let safe_path = Self::get_config_path();
-        println!("[Config] 准备读取安全路径: {:?}", safe_path);
-        
+
+        // 1. 如果安全目录（AppData）里没有文件
         if !safe_path.exists() {
-            println!("[Config] 安全路径不存在，尝试寻找旧文件...");
+            // 尝试读取项目根目录下的旧 config.json
             let legacy_path = PathBuf::from("config.json");
             if legacy_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&legacy_path) {
+                    // 注意：旧版的 JSON 里是 "dbx_exe"，新版是 "mcp_exes"。
+                    // 为了兼容，这里先按新格式反序列化，如果失败或者缺失，会触发 apply_fallbacks
                     if let Ok(cfg) = serde_json::from_str::<Config>(&content) {
-                        let _ = cfg.save();
-                        println!("[Config] 旧文件迁移成功！");
+                        let _ = cfg.save(); // 迁移到 AppData
                         return Ok(Self::apply_fallbacks(cfg));
+                    } else {
+                        // 如果解析失败（大概率因为旧版字段不匹配），直接返回默认配置并保存
+                        let default_cfg = Self::default();
+                        let _ = default_cfg.save();
+                        return Ok(default_cfg);
                     }
                 }
             }
-            println!("[Config] 未找到任何配置文件，使用全默认配置。");
-            return Ok(Self::default());
+            // 如果连旧文件都没有，说明是纯第一次运行
+            let default_cfg = Self::default();
+            let _ = default_cfg.save();
+            return Ok(default_cfg);
         }
 
-        println!("[Config] 安全路径文件已存在，直接读取...");
+        // 2. 如果安全目录已有文件，正常读取
         let content = std::fs::read_to_string(&safe_path)
             .map_err(|e| anyhow::anyhow!("读取 {:?} 失败：{}", safe_path, e))?;
-        
-        let cfg: Config = serde_json::from_str(&content).unwrap_or_else(|e| {
-            println!("[Config] 解析失败: {}，强制重置为默认配置。", e);
-            Self::default()
-        });
-        
+
+        // 如果解析失败，直接回退到默认配置，防止崩溃
+        let cfg: Config = serde_json::from_str(&content).unwrap_or_else(|_| Self::default());
+
         Ok(Self::apply_fallbacks(cfg))
     }
 
-    // ✅ 智能兜底：如果字段是空字符串，自动填入默认值
+    /// 智能兜底：如果读取出来的字段是空的，自动填入默认值
     fn apply_fallbacks(mut cfg: Config) -> Self {
         let defaults = Self::default();
         let mut changed = false;
 
-        if cfg.deepseek_url.trim().is_empty() { cfg.deepseek_url = defaults.deepseek_url; changed = true; }
-        if cfg.model.trim().is_empty() { cfg.model = defaults.model; changed = true; }
-        if cfg.dbx_exe.trim().is_empty() { cfg.dbx_exe = defaults.dbx_exe; changed = true; }
-        if cfg.system_prompt.trim().is_empty() { cfg.system_prompt = defaults.system_prompt; changed = true; }
+        if cfg.deepseek_url.trim().is_empty() {
+            cfg.deepseek_url = defaults.deepseek_url;
+            changed = true;
+        }
+        if cfg.model.trim().is_empty() {
+            cfg.model = defaults.model;
+            changed = true;
+        }
+
+        // ✅ 检查 mcp_exes 是否为空
+        if cfg.mcp_exes.is_empty() {
+            cfg.mcp_exes = defaults.mcp_exes.clone();
+            changed = true;
+        }
+
+        if cfg.system_prompt.trim().is_empty() {
+            cfg.system_prompt = defaults.system_prompt;
+            changed = true;
+        }
 
         if changed {
-            println!("[Config] 发现空字段，已自动补充默认配置。");
+            let _ = cfg.save(); // 补全默认值后自动保存一次
         }
         cfg
     }
